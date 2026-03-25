@@ -16,7 +16,7 @@ from vllm_ascend.utils import (AscendDeviceType, enable_sp, flashcomm2_enable,
                                get_ascend_device_type, has_layer_idx,
                                is_drafter_moe_model, is_moe_model,
                                speculative_enable_dispatch_gmm_combine_decode)
-
+from vllm.logger import logger
 
 class MoECommType(Enum):
     ALLGATHER = 0
@@ -259,6 +259,7 @@ def select_moe_comm_method(num_tokens: int,
         dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (
             not is_draft_model) and (not dynamic_eplb)
         if num_tokens <= mc2_tokens_capacity:
+            # logger.info(f"Enable MC2 for current batch since num_tokens ({num_tokens}) <= mc2_tokens_capacity ({mc2_tokens_capacity})")
             fused_decode_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
@@ -267,6 +268,7 @@ def select_moe_comm_method(num_tokens: int,
                     speculative_enable_dispatch_gmm_combine_decode(vllm_config)
             moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
         else:
+            # logger.info(f"Disable MC2 for current batch since num_tokens ({num_tokens}) > mc2_tokens_capacity ({mc2_tokens_capacity})")
             fused_prefill_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 fused_prefill_enable = fused_mc2_enable and dispatch_ffn_combine_enable

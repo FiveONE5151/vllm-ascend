@@ -153,7 +153,15 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         self.enable_shared_expert_dp = enable_shared_expert_dp
 
         padded_hidden_states_shape = hidden_states.shape
+
+        # [yiwu] for qwen3, we set flashcomm1 to false, so wont enable sp, so replace_allreduce=false and enable_shared_expert_dp=false, 
+        # so will enter this branch. 
+        # In this case, we need to pad the hidden states and router logits to be divisible by tp_size, 
+        # then slice them across tp ranks. 
+        # This is to ensure that the all2all communication can be done correctly without worrying about uneven splits.
         if not (self.replace_allreduce or self.enable_shared_expert_dp):
+
+            # [yiwu] here is global num of tokens
             self.num_tokens, _ = hidden_states.shape
             pad_size = self.tp_size - self.num_tokens  # Pad to TP size (cyclic)
 

@@ -15,11 +15,15 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import csv
+import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -32,8 +36,201 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher, TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
+from vllm.logger import logger
+from vllm.distributed import get_ep_group
 
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
+TOKEN_DROP_STATS_CSV_PATH = "/mnt/jiayihuang_fs/yiwu/research/eplb_superpod/log/tokendrop/token_drop_stats.csv"
+
+
+def _is_global_rank0() -> bool:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def _maybe_record_token_drop_stats(
+    layer_idx: Optional[int],
+    num_global_experts: int,
+    ids_before_drop: torch.Tensor,
+    scores_after_drop: torch.Tensor,
+) -> None:
+    if not envs_ascend.VLLM_TOKEN_DROP_LOGGING or num_global_experts <= 0:
+        return
+    if not _is_global_rank0():
+        return
+
+    before_counts = torch.bincount(ids_before_drop.to(torch.int64),
+                                   minlength=num_global_experts)
+    kept_mask = scores_after_drop > 0
+    if kept_mask.any():
+        after_counts = torch.bincount(ids_before_drop[kept_mask].to(
+            torch.int64),
+                                      minlength=num_global_experts)
+    else:
+        after_counts = torch.zeros(num_global_experts,
+                                   dtype=torch.int64,
+                                   device=before_counts.device)
+
+    baseline_avg = (before_counts.sum().item() / num_global_experts
+                    if num_global_experts > 0 else 0.0)
+    if baseline_avg > 0:
+        pre_ratios = before_counts.to(torch.float32) / baseline_avg
+        post_ratios = after_counts.to(torch.float32) / baseline_avg
+    else:
+        pre_ratios = torch.zeros_like(before_counts, dtype=torch.float32)
+        post_ratios = torch.zeros_like(after_counts, dtype=torch.float32)
+
+    os.makedirs(os.path.dirname(TOKEN_DROP_STATS_CSV_PATH), exist_ok=True)
+    file_exists = os.path.exists(TOKEN_DROP_STATS_CSV_PATH)
+    write_header = (not file_exists) or os.path.getsize(
+        TOKEN_DROP_STATS_CSV_PATH) == 0
+
+    rows = []
+    layer_val = int(layer_idx) if layer_idx is not None else -1
+    before_list = before_counts.tolist()
+    after_list = after_counts.tolist()
+    pre_ratio_list = pre_ratios.tolist()
+    post_ratio_list = post_ratios.tolist()
+    for expert_idx in range(num_global_experts):
+        rows.append({
+            "layer_idx": layer_val,
+            "expert_idx": expert_idx,
+            "pre_drop_load": before_list[expert_idx],
+            "post_drop_load": after_list[expert_idx],
+            "baseline_avg_load_pre_drop": baseline_avg,
+            "pre_ratio_vs_pre_drop_avg": pre_ratio_list[expert_idx],
+            "post_ratio_vs_pre_drop_avg": post_ratio_list[expert_idx],
+        })
+
+    fieldnames = [
+        "layer_idx",
+        "expert_idx",
+        "pre_drop_load",
+        "post_drop_load",
+        "baseline_avg_load_pre_drop",
+        "pre_ratio_vs_pre_drop_avg",
+        "post_ratio_vs_pre_drop_avg",
+    ]
+    with open(TOKEN_DROP_STATS_CSV_PATH, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _global_capacity_token_drop(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: Optional[torch.Tensor],
+    num_global_experts: int,
+    load_factor: float,
+    group,
+    layer_idx: Optional[int] = None,
+) -> torch.Tensor:
+
+    """do token drop
+
+    Returns:
+        topk_weights: topk_weights after drop, dropped tokens' weight will be set to 0
+    """
+    if topk_weights.numel() == 0 or num_global_experts <= 0:
+        return topk_weights
+
+    flat_ids = topk_ids.reshape(-1).to(torch.int64)
+    flat_weights = topk_weights.reshape(-1)
+
+    # [yiwu] local token数量， 经过topk扩展
+    local_count = int(flat_ids.numel())
+    if local_count == 0:
+        return topk_weights
+
+    topk = int(topk_weights.size(-1))
+
+    def _apply_capacity(ids: torch.Tensor, scores: torch.Tensor,
+                        pair_count: int) -> torch.Tensor:
+        if pair_count == 0:
+            return scores
+        if topk <= 0 or pair_count % topk != 0:
+            return scores
+
+        num_tokens = pair_count // topk
+        ids_2d = ids.view(num_tokens, topk).to(torch.int64)
+        scores_2d = scores.view(num_tokens, topk)
+
+        logits_dtype = router_logits.dtype if router_logits is not None else scores_2d.dtype
+        router_logits_ref = torch.zeros((num_tokens, num_global_experts),
+                                        device=scores_2d.device,
+                                        dtype=logits_dtype)
+
+        topk_masked_scores = torch.zeros_like(router_logits_ref).scatter(
+            1, ids_2d, scores_2d)
+        topk_mask = torch.zeros_like(router_logits_ref,
+                                     dtype=torch.int32).scatter(
+                                         1, ids_2d, 1).bool()
+
+        expert_capacity = math.ceil((num_tokens * topk /
+                                     float(num_global_experts)) * load_factor)
+        expert_capacity = min(max(expert_capacity, 0), num_tokens)
+        if expert_capacity == 0:
+            return torch.zeros_like(scores)
+
+        _, capacity_indices = torch.topk(topk_masked_scores,
+                                         k=expert_capacity,
+                                         dim=0,
+                                         sorted=False)
+        capacity_mask = torch.zeros_like(router_logits_ref,
+                                         dtype=torch.bool).scatter(
+                                             0, capacity_indices, True)
+        final_mask = topk_mask & capacity_mask
+
+        final_scores = scores_2d.masked_fill(~final_mask.gather(1, ids_2d),
+                                             0.0)
+        return final_scores.reshape(-1)
+
+    if (not dist.is_available()) or (not dist.is_initialized()):
+        dropped_scores = _apply_capacity(flat_ids, flat_weights, local_count)
+        _maybe_record_token_drop_stats(layer_idx, num_global_experts, flat_ids,
+                                       dropped_scores)
+        return dropped_scores.reshape_as(topk_weights)
+
+    world_size = dist.get_world_size(group=group)
+    if world_size == 1:
+        dropped_scores = _apply_capacity(flat_ids, flat_weights, local_count)
+        _maybe_record_token_drop_stats(layer_idx, num_global_experts, flat_ids,
+                                       dropped_scores)
+        return dropped_scores.reshape_as(topk_weights)
+    rank = dist.get_rank(group=group)
+
+    counts = [local_count for _ in range(world_size)]
+
+    gathered_ids = [torch.empty_like(flat_ids) for _ in range(world_size)]
+    gathered_weights = [
+        torch.empty_like(flat_weights) for _ in range(world_size)
+    ]
+    global_ids = get_ep_group().all_gather(flat_ids, dim=0)
+    global_weights = get_ep_group().all_gather(flat_weights, dim=0)
+    # dist.all_gather(gathered_ids, flat_ids, group=group)
+    # dist.all_gather(gathered_weights, flat_weights, group=group)
+
+    # global_ids = torch.cat(gathered_ids, dim=0)
+    # global_weights = torch.cat(gathered_weights, dim=0)
+
+    global_pairs = int(global_ids.numel())
+    if global_pairs == 0:
+        return topk_weights
+
+    dropped_global_weights = _apply_capacity(global_ids, global_weights,
+                                             global_pairs)
+    _maybe_record_token_drop_stats(layer_idx, num_global_experts, global_ids,
+                                   dropped_global_weights)
+    keep_mask_global = dropped_global_weights > 0
+
+    local_offset = sum(counts[:rank])
+    local_keep = keep_mask_global[local_offset:local_offset + local_count]
+    local_keep = local_keep.reshape_as(topk_weights)
+
+    return topk_weights.masked_fill(~local_keep, 0.0)
 
 
 def get_moe_comm_method(
@@ -98,6 +295,7 @@ class MoECommMethod(ABC):
             hidden_states: torch.Tensor,
             w1: torch.Tensor | list[torch.Tensor],
             w2: torch.Tensor | list[torch.Tensor],
+            router_logits: torch.Tensor,
             topk_weights: torch.Tensor,
             topk_ids: torch.Tensor,
             activation: str = "silu",
@@ -130,7 +328,28 @@ class MoECommMethod(ABC):
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
 
+        ### [yiwu] token drop begin
+        forward_context = get_forward_context()
+        if envs_ascend.VLLM_ENABLE_TOKEN_DROP and forward_context.moe_comm_type in {
+                MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2
+        }:
+            topk_weights = _global_capacity_token_drop(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                num_global_experts=self.moe_config.num_experts,
+                load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR,
+                group=get_ep_group().device_group,
+                layer_idx=getattr(forward_context, "layer_idx", None),
+            )
+
+        ### [yiwu] token drop end
+
         before_dispatch_evt = torch.npu.current_stream().record_event()
+
+        # all2all and mc2 prepare will pad tokens and split it, take only part of global tokens
+        # logger.info(f"[yiwu][DEBUG][Rank {get_ep_group().rank}] num of tokens before dispatch: {hidden_states.size(0)}")
+
         dispatch_results = self.token_dispatcher.token_dispatch(
             hidden_states=hidden_states,
             topk_weights=topk_weights,
@@ -143,6 +362,11 @@ class MoECommMethod(ABC):
             with_quant=use_int8_w8a8 or use_int4_w4a8,
             dynamic_eplb=dynamic_eplb,
             pertoken_scale=pertoken_scale)
+
+        # [yiwu] the hiddenstates are permuted and only contain the tokens for local experts, 
+        # so the num of tokens may change after dispatch, log it here for debugging and analysis.
+        # logger.info(f"[yiwu][DEBUG][Rank {get_ep_group().rank}] using comm method: {moe_comm_method.__class__.__name__}")
+        # logger.info(f"[yiwu][DEBUG][Rank {get_ep_group().rank}] num of tokens after dispatch: {dispatch_results.hidden_states.size(0)}")
 
         mlp_output = unified_apply_mlp(
             hidden_states=dispatch_results.hidden_states,
@@ -275,6 +499,7 @@ class FusedMC2CommImpl(MoECommMethod):
             w2: torch.Tensor | list[torch.Tensor],
             topk_weights: torch.Tensor,
             topk_ids: torch.Tensor,
+            router_logits: Optional[torch.Tensor] = None,
             activation: str = "silu",
             apply_router_weight_on_input: bool = False,
             use_int8_w8a8: bool = False,
@@ -303,6 +528,22 @@ class FusedMC2CommImpl(MoECommMethod):
         # Apply log2phy if needed
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
+
+        ### [yiwu] token drop begin
+        forward_context = get_forward_context()
+        if envs_ascend.VLLM_ENABLE_TOKEN_DROP and forward_context.moe_comm_type in {
+                MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2
+        }:
+            topk_weights = _global_capacity_token_drop(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                num_global_experts=self.moe_config.num_experts,
+                load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR,
+                group=get_ep_group().device_group,
+                layer_idx=getattr(forward_context, "layer_idx", None),
+            )
+        ### [yiwu] token drop end
 
         group_list_type = None
         expert_tokens = None

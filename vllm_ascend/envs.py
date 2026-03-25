@@ -139,6 +139,18 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
+
+    ### [yiwu] token drop related envs
+    "VLLM_ENABLE_TOKEN_DROP":
+    lambda: bool(int(os.getenv("VLLM_ENABLE_TOKEN_DROP", '0'))),
+
+    "VLLM_TOKEN_DROP_LOAD_FACTOR":
+    lambda: float(os.getenv("VLLM_TOKEN_DROP_LOAD_FACTOR", 2)),
+
+    "VLLM_TOKEN_DROP_LOGGING":
+    lambda: bool(int(os.getenv("VLLM_TOKEN_DROP_LOGGING", '0'))),
+
+    ### [yiwu] end token drop related envs
 }
 
 # end-env-vars-definition

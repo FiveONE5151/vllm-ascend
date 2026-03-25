@@ -236,6 +236,7 @@ class AscendW4A16FusedMoEMethod:
                                              w2_offset=layer.w2_weight_offset,
                                              topk_weights=topk_weights,
                                              topk_ids=topk_ids,
+                                             router_logits=router_logits,
                                              use_int4_w4a16=True,
                                              expert_map=expert_map,
                                              log2phy=log2phy,

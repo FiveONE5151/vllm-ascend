@@ -17,6 +17,8 @@
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Callable, Optional
+import csv
+import os
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +55,148 @@ from vllm_ascend.utils import (AscendDeviceType, enable_sp,
                                shared_experts_calculation_stream,
                                vllm_version_is)
 
+import vllm_ascend.envs as envs
+import logging
+from vllm.logger import _FORMAT, _DATE_FORMAT
+import math
+import torchair
+
+TOKEN_DROP_CSV_PATH = "/mnt/jiayihuang_fs/yiwu/research/eplb_superpod/log/tokendrop/token_drop_stats.csv"
+
+# config = torchair.CompilerConfig()
+# config.mode = "reduce-overhead"
+# npu_backend = torchair.get_npu_backend(compiler_config=config)
+# torchair.logger.setLevel(logging.DEBUG)
+# @torch.compile(dynamic=True, backend=npu_backend)
+def token_drop(router_logits: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, num_global_experts: int, load_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
+    
+    topk = topk_weights.size(-1)
+
+    # put the topk weights into the full expert size
+    topk_masked_scores = torch.zeros_like(router_logits).scatter(1, topk_ids, topk_weights) # n_tokens, num_global_experts
+
+    # get topk mask into full expert size
+    topk_mask = torch.zeros_like(router_logits).int().scatter(1, topk_ids, 1).bool() # n_tokens, num_global_experts
+
+    # calculate expert capacity as the load_factor times average load
+    # round up the expert capacity to integer
+    expert_capacity = math.ceil((topk_weights.size(0) * topk / float(num_global_experts)) * load_factor)
+    # prune the scores based on expert capacity
+    _, capacity_indices = torch.topk(topk_masked_scores, k=expert_capacity, dim=0, sorted=False) # expert_capacity, num_global_experts
+
+    # get capacity mask in shape of (n_tokens, num_global_experts)
+    capacity_mask = torch.zeros_like(router_logits).bool().scatter(0, capacity_indices, True) # n_tokens, num_global_experts
+
+    # get final mask which satisfy both topk and capacity constrains
+    final_mask = topk_mask & capacity_mask  # n_tokens, num_global_experts
+
+    # [DEBUG] cant set to -1, as it will lead to choosing the last expert.
+    # check vllm-workspace/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py:373
+    # dont modify topk_ids here, just set the dropped tokens topk weights to 0
+    # it will still compute the token-expert pair, but in combine stage, the dropped token will not contribute to the final output since its weight is 0.
+    # TODO: modify so the actual drop process happens
+    final_topk_ids = topk_ids
+    final_topk_weights = topk_weights.masked_fill(~final_mask.gather(1, topk_ids), 0.0)
+
+    return final_topk_weights, final_topk_ids
+
+def expanded_drop(topk_weights: torch.Tensor, topk_ids: torch.Tensor, load_factor: int) -> tuple[torch.Tensor, torch.Tensor]:
+    pass
+
+def _compute_load_stats(topk_ids: torch.Tensor,
+                        num_global_experts: int,
+                        topk_weights: Optional[torch.Tensor] = None):
+    if topk_weights is None:
+        active_mask = torch.ones_like(topk_ids, dtype=torch.bool)
+    else:
+        active_mask = topk_weights > 0
+
+    if active_mask.any():
+        active_ids = topk_ids.masked_select(active_mask).to(torch.int64)
+        global_expert_load = torch.bincount(active_ids,
+                                            minlength=num_global_experts)
+    else:
+        global_expert_load = torch.zeros(num_global_experts,
+                                         device=topk_ids.device,
+                                         dtype=torch.int64)
+
+    num_devices = get_ep_group().world_size
+    device_chunks = torch.tensor_split(global_expert_load, num_devices)
+    device_loads = torch.stack([chunk.sum() for chunk in device_chunks])
+    avg_expert_load = (global_expert_load.sum().item() / num_global_experts
+                       if num_global_experts > 0 else 0.0)
+
+    return global_expert_load, device_loads, avg_expert_load
+
+
+def _build_ratio_rows(layer_idx: int,
+                      stage: str,
+                      expert_loads: torch.Tensor,
+                      device_loads: torch.Tensor,
+                      baseline_avg_load: float):
+    if baseline_avg_load <= 0:
+        expert_ratios = torch.zeros_like(expert_loads, dtype=torch.float32)
+        device_ratios = torch.zeros_like(device_loads, dtype=torch.float32)
+    else:
+        expert_ratios = expert_loads.to(torch.float32) / baseline_avg_load
+        device_ratios = device_loads.to(torch.float32) / baseline_avg_load
+
+    rows = []
+    for expert_idx, (load, ratio) in enumerate(
+            zip(expert_loads.tolist(), expert_ratios.tolist())):
+        rows.append({
+            "layer_idx": layer_idx,
+            "stage": stage,
+            "entity_type": "expert",
+            "entity_idx": expert_idx,
+            "load": load,
+            "baseline_avg_expert_load_before_drop": baseline_avg_load,
+            "ratio_vs_pre_drop_avg": ratio,
+        })
+
+    for device_idx, (load, ratio) in enumerate(
+            zip(device_loads.tolist(), device_ratios.tolist())):
+        rows.append({
+            "layer_idx": layer_idx,
+            "stage": stage,
+            "entity_type": "device",
+            "entity_idx": device_idx,
+            "load": load,
+            "baseline_avg_expert_load_before_drop": baseline_avg_load,
+            "ratio_vs_pre_drop_avg": ratio,
+        })
+
+    return rows
+
+
+def _is_global_rank0() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def _append_token_drop_csv(rows) -> None:
+    if not rows:
+        return
+
+    os.makedirs(os.path.dirname(TOKEN_DROP_CSV_PATH), exist_ok=True)
+    file_exists = os.path.exists(TOKEN_DROP_CSV_PATH)
+    write_header = (not file_exists) or os.path.getsize(TOKEN_DROP_CSV_PATH) == 0
+
+    fieldnames = [
+        "layer_idx",
+        "stage",
+        "entity_type",
+        "entity_idx",
+        "load",
+        "baseline_avg_expert_load_before_drop",
+        "ratio_vs_pre_drop_avg",
+    ]
+    with open(TOKEN_DROP_CSV_PATH, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
 @dataclass
 class FusedMoEResult:
@@ -134,7 +278,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 hidden_states=x,
             )
 
-        topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
@@ -152,6 +295,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            router_logits=router_logits,
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             dynamic_eplb=self.dynamic_eplb,
@@ -171,6 +315,9 @@ class AscendFusedMoE(FusedMoE):
         num_experts = kwargs["num_experts"]
         intermediate_size = kwargs["intermediate_size"]
         num_shared_experts = kwargs.get("n_shared_experts", 0)
+
+        logger.info(f"[yiwu][DEBUG] SP is {enable_sp()}")
+
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter

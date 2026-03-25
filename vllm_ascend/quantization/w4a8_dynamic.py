@@ -385,6 +385,7 @@ class AscendW4A8DynamicFusedMoEMethod:
             w2_scale_bias=layer.w2_scale_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            router_logits=router_logits,
             use_int4_w4a8=True,
             expert_map=expert_map,
             log2phy=log2phy,

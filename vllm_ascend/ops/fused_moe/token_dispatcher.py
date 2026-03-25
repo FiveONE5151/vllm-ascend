@@ -430,6 +430,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
 
+        # [yiwu] get token stats, and permuted tokens
         (
             permutated_local_input_tokens,
             reversed_local_input_permutation_mapping,
@@ -449,6 +450,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
+        # [yiwu] perform all2all communication
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
             permutated_local_input_tokens, output_splits, input_splits,
             self.ep_group)
@@ -456,6 +458,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Postprocess
+        # [yiwu] do permutation to place tokens by local experts order
         global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = self._dispatch_postprocess(
             global_input_tokens, dynamic_scale_after_all2all,
             global_input_tokens_local_experts_indices)

@@ -278,6 +278,7 @@ class AscendW8A8DynamicFusedMoEMethod:
             w2_scale=[layer.fused_w2_scale] if fused_scale_flag else w2_scale,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            router_logits=router_logits,
             use_int8_w8a8=True,
             expert_map=expert_map,
             log2phy=log2phy,
