@@ -36,6 +36,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAllGather, PrepareAndFinalizeWithMC2, QuantType)
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher, TokenDispatcherWithAll2AllV,
+    TokenDispatcherWithAll2AllvTokenDrop,
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
 
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
@@ -251,6 +252,12 @@ class AlltoAllCommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
+        if envs_ascend.VLLM_ENABLE_TOKEN_DROP:
+            return TokenDispatcherWithAll2AllvTokenDrop(
+                top_k=self.moe_config.experts_per_token,
+                num_experts=self.moe_config.num_experts,
+                num_local_experts=self.moe_config.num_local_experts,
+                token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR)
         return TokenDispatcherWithAll2AllV(
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,

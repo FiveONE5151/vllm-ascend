@@ -22,6 +22,7 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import math
 from typing import Optional, overload, override
 
 import torch
@@ -58,6 +59,8 @@ class MoETokenDispatcher(ABC):
         Initialize the MoE Token Dispatcher.
         """
         self.top_k = kwargs.get("top_k", 0)
+
+        # num of global experts
         self.num_experts = kwargs.get("num_experts", 0)
 
     @property
@@ -652,6 +655,145 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
+
+    def _compute_kept_tokens_per_rank_expert(
+            self,
+            num_global_tokens_per_expert: torch.Tensor,
+            expert_capacity: int) -> torch.Tensor:
+
+        """get tokens for each global experts after drop
+
+        Args:
+            num_global_tokens_per_expert (torch.Tensor): shape [ep_size, num_experts], num of initial local tokens of each rank processed by each global expert
+            expert_capacity (int): max num of tokens each global expert can process after drop
+
+        Returns:
+            kept: shape [ep_size, num_experts], num of global tokens kept for each expert (global experts)
+        """
+        kept = torch.zeros_like(num_global_tokens_per_expert)
+        for expert_idx in range(self.num_experts):
+            remain = expert_capacity
+            for rank_idx in range(self.ep_size):
+                current = int(num_global_tokens_per_expert[rank_idx, expert_idx].item())
+                if remain <= 0 or current <= 0:
+                    continue
+                keep_now = min(current, remain)
+                kept[rank_idx, expert_idx] = keep_now
+                remain -= keep_now
+        return kept
+
+    def _get_local_permute_keep_indices(
+            self,
+            num_local_tokens_per_expert: torch.Tensor,
+            num_local_tokens_per_expert_kept: torch.Tensor,
+            device: torch.device) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            num_local_tokens_per_expert (torch.Tensor): shape [num_experts], num of initial local tokens processed by each global expert
+            num_local_tokens_per_expert_kept (torch.Tensor): shape [num_experts], num of local tokens kept for each global expert after drop
+            device (torch.device): 
+
+        Returns:
+            torch.Tensor: kept_indices: the indices of local tokens to keep after drop in the local permuted token sequence; shape [num_local_tokens_kept]
+        """
+
+        # prefix sum of local tokens processed by each global experts
+        # use to represent offset for each global expert in the local permuted token sequence
+        starts = torch.cumsum(num_local_tokens_per_expert.to(torch.int64), dim=0)
+        starts = torch.cat(
+            [torch.tensor([0], dtype=torch.int64, device=starts.device), starts[:-1]])
+
+        kept_indices: list[torch.Tensor] = []
+        for expert_idx in range(self.num_experts):
+            keep_count = int(num_local_tokens_per_expert_kept[expert_idx].item())
+            if keep_count <= 0:
+                continue
+            start = int(starts[expert_idx].item())
+            kept_indices.append(
+                torch.arange(start,
+                             start + keep_count,
+                             device=device,
+                             dtype=torch.int64))
+
+        if not kept_indices:
+            return torch.empty(0, dtype=torch.int64, device=device)
+        return torch.cat(kept_indices, dim=0)
+
+    def _preprocess_with_token_drop(self, topk_ids: torch.Tensor):
+        num_local_tokens_per_expert = torch.histc(topk_ids,
+                                                  bins=self.num_experts,
+                                                  min=0,
+                                                  max=self.num_experts)
+        
+        # shape: [num_experts], num of initial local tokens processed by each global expert
+        num_local_tokens_per_expert = num_local_tokens_per_expert.to(torch.int64)
+
+        ep_size = self.ep_size
+        self.num_out_tokens = topk_ids.numel()
+
+        # shape: [ep_size, num_experts], num of initial local tokens of each rank processed by each global expert
+        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
+            num_local_tokens_per_expert,
+            group=self.ep_group).reshape(ep_size, self.num_experts).to(torch.int64)
+
+        global_avg_tokens_per_expert = (
+            num_global_tokens_per_expert.sum().to(torch.float32) /
+            float(self.num_experts))
+        expert_capacity = int(
+            math.ceil(float(global_avg_tokens_per_expert.item()) *
+                      self.token_drop_load_factor))
+        expert_capacity = max(expert_capacity, 0)
+
+        # shape: [ep_size, num_experts], num of initial local tokens of each rank processed by each global expert after drop
+        kept_tokens_per_rank_expert = self._compute_kept_tokens_per_rank_expert(
+            num_global_tokens_per_expert, expert_capacity)
+
+        num_local_tokens_per_expert_kept = kept_tokens_per_rank_expert[
+            self.ep_rank].to(torch.int64)
+        self.num_out_tokens_after_drop = int(
+            num_local_tokens_per_expert_kept.sum().item())
+
+        # get local permute keep indices for token drop, shape: [num_local_tokens_kept]
+        local_permute_keep_indices = self._get_local_permute_keep_indices(
+            num_local_tokens_per_expert,
+            num_local_tokens_per_expert_kept,
+            topk_ids.device,
+        )
+
+        input_splits = (num_local_tokens_per_expert_kept.reshape(
+            ep_size, self.num_local_experts).sum(axis=1).to(torch.device("cpu"),
+                                                            non_blocking=True).numpy())
+
+        num_global_tokens_per_local_expert = kept_tokens_per_rank_expert[:,
+                                                                          self.local_expert_indices[
+                                                                              0]:self.local_expert_indices[-1] +
+                                                                          1]
+        output_splits = (num_global_tokens_per_local_expert.sum(axis=-1).to(
+            torch.device("cpu"), non_blocking=True).numpy())
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(
+            axis=0).to(torch.int64)
+
+        global_input_tokens_local_experts_indices = None
+        if self.num_local_experts > 1:
+            global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.ravel())
+        else:
+            torch.npu.synchronize()
+
+        return (
+            num_tokens_per_local_expert,
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            global_input_tokens_local_experts_indices,
+            local_permute_keep_indices,
+            expert_capacity,
+            global_avg_tokens_per_expert,
+            num_global_tokens_per_expert,
+        )
 
     @override
     def token_dispatch(self,
@@ -686,16 +828,35 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
 
-        # [yiwu] get token stats, and permuted tokens
+        assert self.hidden_shape is not None
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        self.hidden_shape_before_permute = hidden_states.shape
+
         (
-            permutated_local_input_tokens,
-            reversed_local_input_permutation_mapping,
             tokens_per_expert,
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
             global_input_tokens_local_experts_indices,
-        ) = self._dispatch_preprocess(hidden_states, topk_ids)
+            local_permute_keep_indices,
+            expert_capacity,
+            global_avg_tokens_per_expert,
+            num_global_tokens_per_expert_before_drop,
+        ) = self._preprocess_with_token_drop(topk_ids)
+
+        self.num_out_tokens_before_drop = self.num_out_tokens
+        self.num_out_tokens = self.num_out_tokens_after_drop
+
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = torch_npu.npu_moe_token_permute(
+            tokens=hidden_states,
+            indices=topk_ids,
+            num_out_tokens=self.num_out_tokens_before_drop,
+        )
+
+
+        # select kept tokens after drop in the local permuted token sequence
+        permutated_local_input_tokens = permutated_local_input_tokens.index_select(
+            0, local_permute_keep_indices)
 
         dynamic_scale_after_all2all = None
         if self.with_quant:
@@ -729,7 +890,19 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             "reversed_local_input_permutation_mapping":
             reversed_local_input_permutation_mapping,
             "reversed_global_input_permutation_mapping":
-            reversed_global_input_permutation_mapping
+            reversed_global_input_permutation_mapping,
+            "local_permute_keep_indices":
+            local_permute_keep_indices,
+            "num_out_tokens_before_drop":
+            self.num_out_tokens_before_drop,
+            "expert_capacity":
+            expert_capacity,
+            "global_avg_tokens_per_expert_before_drop":
+            global_avg_tokens_per_expert,
+            "num_global_tokens_per_expert_before_drop":
+            num_global_tokens_per_expert_before_drop,
+            "num_global_tokens_per_local_expert_after_drop":
+            num_global_tokens_per_local_expert,
         }
 
         return TokenDispatchResult(
@@ -758,8 +931,20 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         handle.wait()
         hidden_states.untyped_storage().resize_(0)
 
+        restored_local_tokens = torch.zeros(
+            (context_metadata["num_out_tokens_before_drop"],
+             permutated_local_input_tokens.shape[-1]),
+            dtype=permutated_local_input_tokens.dtype,
+            device=permutated_local_input_tokens.device,
+        )
+        restored_local_tokens.index_copy_(0,
+                                          context_metadata[
+                                              "local_permute_keep_indices"],
+                                          permutated_local_input_tokens)
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
         # 3. Postprocess using metadata
-        output = self._combine_postprocess(permutated_local_input_tokens,
+        output = self._combine_postprocess(restored_local_tokens,
                                            context_metadata)
 
         return TokenCombineResult(routed_out=output)

@@ -24,7 +24,8 @@ from tests.ut.base import TestBase
 
 from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     AscendDeviceType, TokenDispatcherWithAll2AllV,
-    TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
+    TokenDispatcherWithAll2AllvTokenDrop, TokenDispatcherWithAllGather,
+    TokenDispatcherWithMC2)
 
 
 class TestTokenDispatcherWithMC2(TestBase):
@@ -447,6 +448,84 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
+
+    def setUp(self):
+        patcher1 = patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                                'ep_group',
+                                new_callable=PropertyMock,
+                                return_value=MagicMock())
+        patcher2 = patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                                'ep_rank',
+                                new_callable=PropertyMock,
+                                return_value=0)
+        patcher3 = patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                                'ep_size',
+                                new_callable=PropertyMock,
+                                return_value=16)
+        patcher4 = patch('torch.distributed.get_rank', return_value=0)
+        patcher5 = patch('torch.npu.current_device', return_value='cpu')
+
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
+        self.addCleanup(patcher3.stop)
+        self.addCleanup(patcher4.stop)
+        self.addCleanup(patcher5.stop)
+
+        patcher1.start()
+        patcher2.start()
+        patcher3.start()
+        patcher4.start()
+        patcher5.start()
+
+        self.dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=6,
+            num_experts=128,
+            num_local_experts=8,
+            token_drop_load_factor=1.2,
+        )
+
+    @pytest.mark.parametrize("topk", [6, 8])
+    def test_capacity_ratio_with_high_topk(self, topk):
+        num_tokens = 16
+        num_experts = self.dispatcher.num_experts
+        load_factor = self.dispatcher.token_drop_load_factor
+
+        topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        topk_ids[:, 0] = 0
+        topk_ids[:, 1] = 1
+        topk_ids[:, 2] = 0
+        topk_ids[:, 3] = 2
+        topk_ids[:, 4] = 0
+        topk_ids[:, 5] = 3
+        if topk > 6:
+            topk_ids[:, 6] = 0
+            topk_ids[:, 7] = 1
+
+        local_hist = torch.bincount(topk_ids.reshape(-1),
+                                    minlength=num_experts).to(torch.int64)
+        remote_hist = torch.tensor([4, 8, 10, 10], dtype=torch.int64)
+        global_hist = torch.stack([local_hist, remote_hist], dim=0)
+
+        with patch(
+                'vllm_ascend.ops.fused_moe.token_dispatcher.gather_from_sequence_parallel_region',
+                return_value=global_hist):
+            (_, _, _, _, _, _, expert_capacity,
+             global_avg_tokens_per_expert,
+             global_before_drop) = self.dispatcher._preprocess_with_token_drop(
+                 topk_ids)
+
+        kept_tokens = self.dispatcher._compute_kept_tokens_per_rank_expert(
+            global_before_drop, expert_capacity)
+        per_expert_after_drop = kept_tokens.sum(dim=0).to(torch.float32)
+
+        avg_before_drop = float(global_avg_tokens_per_expert.item())
+        assert avg_before_drop > 0
+
+        ratio = per_expert_after_drop / avg_before_drop
+        assert torch.all(ratio <= load_factor + 1e-6)
 
     @pytest.mark.skip(
         "Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
