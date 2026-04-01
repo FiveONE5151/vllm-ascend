@@ -22,7 +22,7 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, overload, override
 
 import torch
 import torch_npu
@@ -427,6 +427,24 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
                        pertoken_scale: Optional[torch.Tensor] = None):
+
+        """token dispatch for all2all
+
+        Returns:
+            1) 对外返回：TokenDispatchResult
+                hidden_states：global_input_tokens，已经完成本地 permute + 跨 EP all2all + 本地按 expert 重排后的张量；形状通常是 [本 rank 收到并分配给本地 experts 的 token 总数, hidden]。
+                dynamic_scale：dynamic_scale_final。仅量化开启(with_quant=True)时有效；否则是 None。
+                group_list：tokens_per_expert，表示本 rank 上每个 local expert 的 token 数（count 列表）。
+                group_list_type：固定为 1，表示 group_list 是 “count mode”（不是前缀和/offset 模式）。
+                context_metadata：给 token_combine 用的上下文（见第 2 点）。
+                
+            2) context_metadata 字段含义
+                input_splits：本 rank 在 all2all 中发往各对端 rank 的 token 数（send split）。
+                output_splits：本 rank 在 all2all 中从各对端 rank 接收的 token 数（recv split）。
+                topk_weights：router 给每个 token 的 top-k 权重，combine 时用于加权还原。
+                reversed_local_input_permutation_mapping：第一次本地 npu_moe_token_permute 的逆映射（最终恢复原 token 顺序用）。
+                reversed_global_input_permutation_mapping：第二次“按本地 expert 分组”重排的逆映射；仅 num_local_experts > 1 时有值，否则为 None。
+        """
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
 
@@ -628,3 +646,120 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         )
         output = output.view(self.hidden_shape)
         return output
+
+
+class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @override
+    def token_dispatch(self,
+                       hidden_states: torch.Tensor,
+                       topk_weights: torch.Tensor,
+                       topk_ids: torch.Tensor,
+                       expert_map: Optional[torch.Tensor] = None,
+                       global_redundant_expert_num: int = 0,
+                       mc2_mask: Optional[torch.Tensor] = None,
+                       apply_router_weight_on_input: bool = False,
+                       with_quant: bool = False,
+                       dynamic_eplb: bool = False,
+                       pertoken_scale: Optional[torch.Tensor] = None):
+
+        """token dispatch for all2all
+
+        Returns:
+            1) 对外返回：TokenDispatchResult
+                hidden_states：global_input_tokens，已经完成本地 permute + 跨 EP all2all + 本地按 expert 重排后的张量；形状通常是 [本 rank 收到并分配给本地 experts 的 token 总数, hidden]。
+                dynamic_scale：dynamic_scale_final。仅量化开启(with_quant=True)时有效；否则是 None。
+                group_list：tokens_per_expert，表示本 rank 上每个 local expert 的 token 数（count 列表）。
+                group_list_type：固定为 1，表示 group_list 是 “count mode”（不是前缀和/offset 模式）。
+                context_metadata：给 token_combine 用的上下文（见第 2 点）。
+                
+            2) context_metadata 字段含义
+                input_splits：本 rank 在 all2all 中发往各对端 rank 的 token 数（send split）。
+                output_splits：本 rank 在 all2all 中从各对端 rank 接收的 token 数（recv split）。
+                topk_weights：router 给每个 token 的 top-k 权重，combine 时用于加权还原。
+                reversed_local_input_permutation_mapping：第一次本地 npu_moe_token_permute 的逆映射（最终恢复原 token 顺序用）。
+                reversed_global_input_permutation_mapping：第二次“按本地 expert 分组”重排的逆映射；仅 num_local_experts > 1 时有值，否则为 None。
+        """
+        self.with_quant = with_quant
+        self.hidden_shape = hidden_states.shape
+
+        # [yiwu] get token stats, and permuted tokens
+        (
+            permutated_local_input_tokens,
+            reversed_local_input_permutation_mapping,
+            tokens_per_expert,
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            global_input_tokens_local_experts_indices,
+        ) = self._dispatch_preprocess(hidden_states, topk_ids)
+
+        dynamic_scale_after_all2all = None
+        if self.with_quant:
+            permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
+                permutated_local_input_tokens)
+            _, dynamic_scale_after_all2all, permute2_ep_all_to_all_handle = async_all_to_all(
+                dynamic_scale, output_splits, input_splits, self.ep_group)
+            permute2_ep_all_to_all_handle.wait()
+            dynamic_scale.untyped_storage().resize_(0)
+
+        # [yiwu] perform all2all communication
+        _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
+            permutated_local_input_tokens, output_splits, input_splits,
+            self.ep_group)
+        permute1_ep_all_to_all_handle.wait()
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
+        # Postprocess
+        # [yiwu] do permutation to place tokens by local experts order
+        global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = self._dispatch_postprocess(
+            global_input_tokens, dynamic_scale_after_all2all,
+            global_input_tokens_local_experts_indices)
+
+        context_metadata = {
+            "input_splits":
+            input_splits,
+            "output_splits":
+            output_splits,
+            "topk_weights":
+            topk_weights,
+            "reversed_local_input_permutation_mapping":
+            reversed_local_input_permutation_mapping,
+            "reversed_global_input_permutation_mapping":
+            reversed_global_input_permutation_mapping
+        }
+
+        return TokenDispatchResult(
+            hidden_states=global_input_tokens,
+            dynamic_scale=dynamic_scale_final,
+            group_list=tokens_per_expert,
+            group_list_type=1,
+            context_metadata=context_metadata,
+        )
+
+    @override
+    def token_combine(self, hidden_states, context_metadata, bias=None):
+        assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
+
+        # 1. Preprocess using metadata
+        hidden_states = self._combine_preprocess(hidden_states,
+                                                 context_metadata)
+
+        # 2. AllToAll
+        _, permutated_local_input_tokens, handle = async_all_to_all(
+            hidden_states,
+            context_metadata["input_splits"],
+            context_metadata["output_splits"],
+            self.ep_group,
+        )
+        handle.wait()
+        hidden_states.untyped_storage().resize_(0)
+
+        # 3. Postprocess using metadata
+        output = self._combine_postprocess(permutated_local_input_tokens,
+                                           context_metadata)
+
+        return TokenCombineResult(routed_out=output)

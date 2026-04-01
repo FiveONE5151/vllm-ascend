@@ -251,30 +251,32 @@ def select_moe_comm_method(num_tokens: int,
             moe_comm_type = MoECommType.ALLGATHER
 
     elif soc_version in {AscendDeviceType.A3}:
-        ascend_config = get_ascend_config()
-        dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
-        # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
-        # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
-        fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 and quant_type == "w8a8_dynamic"
-        dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (
-            not is_draft_model) and (not dynamic_eplb)
-        if num_tokens <= mc2_tokens_capacity:
-            # logger.info(f"Enable MC2 for current batch since num_tokens ({num_tokens}) <= mc2_tokens_capacity ({mc2_tokens_capacity})")
-            fused_decode_enable = fused_mc2_enable
-            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-                fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
-                fused_decode_enable = fused_mc2_enable and \
-                    speculative_enable_dispatch_gmm_combine_decode(vllm_config)
-            moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
-        else:
-            # logger.info(f"Disable MC2 for current batch since num_tokens ({num_tokens}) > mc2_tokens_capacity ({mc2_tokens_capacity})")
-            fused_prefill_enable = fused_mc2_enable
-            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-                fused_prefill_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
-                fused_prefill_enable = False
-            moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
+        # ascend_config = get_ascend_config()
+        # dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
+        # # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
+        # # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
+        # fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 and quant_type == "w8a8_dynamic"
+        # dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (
+        #     not is_draft_model) and (not dynamic_eplb)
+        # if num_tokens <= mc2_tokens_capacity:
+        #     # logger.info(f"Enable MC2 for current batch since num_tokens ({num_tokens}) <= mc2_tokens_capacity ({mc2_tokens_capacity})")
+        #     fused_decode_enable = fused_mc2_enable
+        #     if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+        #         fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
+        #     elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
+        #         fused_decode_enable = fused_mc2_enable and \
+        #             speculative_enable_dispatch_gmm_combine_decode(vllm_config)
+        #     moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
+        # else:
+        #     # logger.info(f"Disable MC2 for current batch since num_tokens ({num_tokens}) > mc2_tokens_capacity ({mc2_tokens_capacity})")
+        #     fused_prefill_enable = fused_mc2_enable
+        #     if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+        #         fused_prefill_enable = fused_mc2_enable and dispatch_ffn_combine_enable
+        #     elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
+        #         fused_prefill_enable = False
+        #     moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
+        # TODO: hack
+        moe_comm_type = MoECommType.ALLTOALL
 
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
