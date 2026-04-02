@@ -37,6 +37,7 @@ from vllm_ascend.ops.fused_moe.comm_utils import (
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                is_hierarchical_communication_enabled)
 
+from vllm.forward_context import get_forward_context
 
 @dataclass
 class TokenDispatchResult:
@@ -559,6 +560,13 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
+        """
+        - `input_splits`: 本rank向其他rank发送的token数量, 形状为 `[ep_size]`
+        - `output_splits`: 本rank接收其他rank的token数量, 形状为 `[ep_size]`
+        - `num_global_tokens_per_local_expert`: 本地专家接接收其他rank的token数量, 形状为 `[ep_size, num_local_Experts]`
+        - `num_tokens_per_local_expert`: [num_local_experts,], 本地专家接收的全局token数量
+        - `global_input_tokens_local_experts_indices`: 根据每个local expert的global token数量，生成每个global token对应的local expert id; [num_local_processed_tokens,]
+        """
         num_local_tokens_per_expert = torch.histc(topk_ids,
                                                   bins=self.num_experts,
                                                   min=0,
@@ -658,25 +666,78 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         super().__init__(**kwargs)
         self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
 
-    def _compute_kept_tokens_per_rank_expert(
+    def _compute_output_splits_after_drop(
             self,
             num_global_tokens_per_expert: torch.Tensor,
+            global_topk_ids_after_drop: torch.Tensor,
             expert_capacity: int) -> torch.Tensor:
 
         """get tokens for each global experts after drop
 
         Args:
-            num_global_tokens_per_expert (torch.Tensor): shape [ep_size, num_experts], num of initial local tokens of each rank processed by each global expert
+            num_global_tokens_per_expert (torch.Tensor): shape [ep_size, num_experts], 
+                num of initial input local tokens of each rank processed by each global expert
+            global_topk_ids_after_drop (torch.Tensor): shape [num_global_tokens, topk]
+                dropped tokens will have their expert index set to num_experts (sentinel), 
+                which is not a valid expert index and can be easily masked out in later steps
             expert_capacity (int): max num of tokens each global expert can process after drop
 
         Returns:
-            kept: shape [ep_size, num_experts], num of global tokens kept for each expert (global experts)
+            torch.Tensor: output_splits: shape [ep_size], num of tokens received from each rank after drop
         """
-        counts = num_global_tokens_per_expert.to(torch.int64)
-        prefix_before_rank = torch.cumsum(counts, dim=0) - counts
-        remain_before_rank = torch.clamp(expert_capacity - prefix_before_rank,
-                                         min=0)
-        return torch.minimum(counts, remain_before_rank)
+        num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+        token_offset = torch.cumsum(num_tokens_across_dp) - num_tokens_across_dp
+        input_splits = torch.zeros(self.ep_size, dtype=torch.int64, device=num_global_tokens_per_expert.device)
+        output_splits = torch.zeros(self.ep_size, dtype=torch.int64, device=num_global_tokens_per_expert.device)
+        for rank in range(self.ep_size):
+
+            # [num_experts,]
+            currank_tokens_per_expert = num_global_tokens_per_expert[rank]
+            # [num_tokens_this_rank, topk]
+            currrank_topk_ids_after_drop = global_topk_ids_after_drop[token_offset[rank]:token_offset[rank+1], :]
+
+            # for this rank's topk_ids, the dropped tokens of this rank will have their expert index set to num_experts, 
+            # which is not a valid expert index and can be easily masked out in later steps
+            mask_dropped_tokens = (currrank_topk_ids_after_drop == self.num_experts)
+            mask_sent_to_local_tokens = currrank_topk_ids_after_drop > self.local_expert_indices[0] \
+                    & (currrank_topk_ids_after_drop <= self.local_expert_indices[-1])
+            mask_valid_tokens = ~mask_dropped_tokens & ~mask_sent_to_local_tokens
+            output_splits[rank] = mask_valid_tokens.sum().item()
+        
+        return output_splits
+            
+    def _compute_input_splits_after_drop(
+            self,
+            num_local_tokens_per_expert: torch.Tensor,
+            global_topk_ids_after_drop: torch.Tensor,
+            local_topk_ids_before_drop: torch.Tensor,
+            expert_capacity: int) -> torch.Tensor:
+        """get tokens for each local experts after drop
+        Args:
+            num_local_tokens_per_expert (torch.Tensor): shape [num_experts], 
+                num of local input tokens sent to each global experts
+            global_topk_ids_after_drop (torch.Tensor): shape [num_global_tokens, topk]
+                dropped tokens will have their expert index set to num_experts (sentinel), 
+                which is not a valid expert index and can be easily masked out in later steps
+            expert_capacity (int): max num of tokens each global expert can process after drop
+        Returns:
+            torch.Tensor: input_splits: shape [ep_size], num of tokens sent to each rank after drop
+        """ 
+
+        num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+        token_offset = torch.cumsum(num_tokens_across_dp) - num_tokens_across_dp
+        input_splits = torch.zeros(self.ep_size, dtype=torch.int64, device=num_local_tokens_per_expert.device)
+
+        # [num_local_tokens, topk]
+        this_rank_topk_ids_after_drop = global_topk_ids_after_drop[token_offset[self.ep_rank]:token_offset[self.ep_rank+1], :]
+        
+        # find the index of element in this_rank_topk_ids_after_drop that equals to self.num_experts
+        dropped_indices = (this_rank_topk_ids_after_drop == self.num_experts).nonzero(as_tuple=False)
+        # TODO: IMPLEMENT INPUT_SPLITS AFTER DROP
+            
+        
+        return input_splits
+            
 
     def _get_local_permute_keep_indices(
             self,
@@ -715,8 +776,73 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         if not kept_indices:
             return torch.empty(0, dtype=torch.int64, device=device)
         return torch.cat(kept_indices, dim=0)
+    
+    def _compute_indices(self, scores_sub, mask_sub, expert_capacity):
+        """
+        Args:
+            scores_sub (tensor): router logits的一个子集, [T, num_of_subset_experts]
+            mask_sub (tensor): router logits的子集中被topk选中的位置的mask, [T, num_of_subset_experts]
+            expert_capacity (int): 专家容量
 
-    def _preprocess_with_token_drop(self, topk_ids: torch.Tensor):
+        Returns:
+            capacity_indices: 在scores_sub中被选中且不超过容量限制的位置的indices, [expert_capacity, num_of_subset_experts]
+        """
+        
+        # 把mask无效的位置的score设置为-inf，这样在后续的topk中就不会被选中
+        masked_scores = scores_sub.masked_fill(~mask_sub, float('-inf'))  # ascending 排序，mask无效
+        _, capacity_indices = torch.topk(
+                                    masked_scores, 
+                                    k=expert_capacity, 
+                                    dim=0, 
+                                    sorted=False
+                                    )
+        # 返回 overloaded experts中的topk token indices
+        return capacity_indices
+
+    def _get_topk_ids_weights_after_drop(self, global_topk_ids: torch.Tensor, global_topk_weights: torch.Tensor, expert_capacity: int) -> torch.Tensor:
+        topk = global_topk_ids.shape[-1]
+        
+        mask_buffer = torch.zeros((global_topk_ids.shape[0], self.num_experts),
+                                  dtype=torch.bool,
+                                  device=global_topk_ids.device)
+        scores_buffer = torch.zeros((global_topk_ids.shape[0], self.num_experts),
+                                  dtype=torch.int64,
+                                  device=global_topk_ids.device)
+        # 当前router logits中，被topk选中的tokens和expert位置被标记为True
+        mask_buffer.scatter_(-1, global_topk_ids, True)
+        scores_buffer.scatter_(-1, global_topk_ids, global_topk_weights)
+
+        # [num_global_experts]，统计每个expert的负载
+        current_usage = mask_buffer.sum(dim=0)
+
+        # [num_overloaded_experts]，找出超载的expert indices
+        cols = (current_usage > expert_capacity).nonzero(as_tuple=True)[0]
+        if cols.numel() > 0:
+
+            # 取出超载expert对应的scores和mask
+            # [T, num_overloaded_experts]
+            scores_sub = scores_buffer[:, cols]
+            mask_sub = mask_buffer[:, cols]
+
+            # [expert_capacity, num_of_subset_experts]
+            capacity_indices = self._compute_indices(scores_sub, mask_sub, expert_capacity)
+
+            # 根据capacity_indices更新mask_buffer，标记最终被选中且不超过容量限制的位置
+            mask_buffer[:, cols] = torch.zeros_like(mask_sub).scatter(0, capacity_indices, True)
+
+        # [T, num_global_experts]
+        top_mask = mask_buffer.gather(-1, global_topk_ids)
+
+        # 把最终被选中且不超过容量限制的位置的权重保留，其他位置的权重设置为0
+        # [T, num_global_experts]
+        global_topk_weight = global_topk_weight * top_mask
+
+        # 把最终被选中但超过容量限制的位置的expert index设置为num_experts (sentinel)，表示这些token将被丢弃
+        global_topk_ids = global_topk_ids.masked_fill(~top_mask, self.num_experts)
+
+        return global_topk_weight, global_topk_ids
+
+    def _preprocess_with_token_drop(self, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
         num_local_tokens_per_expert = torch.histc(topk_ids,
                                                   bins=self.num_experts,
                                                   min=0,
@@ -732,6 +858,15 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert,
             group=self.ep_group).reshape(ep_size, self.num_experts).to(torch.int64)
+    
+        # gather global topk_ids
+        global_topk_ids = self.ep_group().all_gatherv(
+            topk_ids, 0, 
+            get_forward_context().dp_metadata.num_tokens_across_dp_cpu.numpy())
+        global_topk_weights = self.ep_group().all_gatherv(
+            topk_weights, 0,
+            get_forward_context().dp_metadata.num_tokens_across_dp_cpu.numpy())
+
 
         global_avg_tokens_per_expert = (
             num_global_tokens_per_expert.sum().to(torch.float32) /
@@ -741,9 +876,21 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
                       self.token_drop_load_factor))
         expert_capacity = max(expert_capacity, 0)
 
+        ###
+        # drop tokens according to topk weights, get the topk_ids after drop
+        global_topk_weights_after_drop, global_topk_ids_after_drop = \
+            self._get_topk_ids_weights_after_drop(global_topk_ids, 
+                                                  global_topk_weights, expert_capacity)
+        ###
+
         # shape: [ep_size, num_experts], num of initial local tokens of each rank processed by each global expert after drop
-        kept_tokens_per_rank_expert = self._compute_kept_tokens_per_rank_expert(
-            num_global_tokens_per_expert, expert_capacity)
+        output_splits = self._compute_output_splits_after_drop(
+            num_global_tokens_per_expert,
+            global_topk_ids_after_drop, expert_capacity)
+
+        input_splits = self._compute_input_splits_after_drop(
+            num_local_tokens_per_expert, global_topk_ids_after_drop, topk_ids, expert_capacity
+        )
 
         num_local_tokens_per_expert_kept = kept_tokens_per_rank_expert[
             self.ep_rank].to(torch.int64)
@@ -760,7 +907,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         input_splits = (num_local_tokens_per_expert_kept.reshape(
             ep_size, self.num_local_experts).sum(axis=1).to(torch.device("cpu"),
                                                             non_blocking=True).numpy())
-
+        
+        # [ep_size, num_local_experts], num of global tokens for each local expert after drop
         num_global_tokens_per_local_expert = kept_tokens_per_rank_expert[:,
                                                                           self.local_expert_indices[
                                                                               0]:self.local_expert_indices[-1] +
@@ -772,6 +920,12 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
+
+            # 根据每个local expert的global token数量，生成每个global token对应的local expert id，用于后续的permutation
+            # eg. epsize=2, num_local_experts=2
+            # expert_ids_per_ep_rank = [0, 1, 0, 1]
+            # num_global_tokens_per_local_expert.ravel() = [3, 1, 2, 0]
+            # got [0,0,0, 1, 0,0]
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 self.expert_ids_per_ep_rank,
                 num_global_tokens_per_local_expert.ravel())
@@ -837,7 +991,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             expert_capacity,
             global_avg_tokens_per_expert,
             num_global_tokens_per_expert_before_drop,
-        ) = self._preprocess_with_token_drop(topk_ids)
+        ) = self._preprocess_with_token_drop(topk_ids, topk_weights)
 
         self.num_out_tokens_before_drop = self.num_out_tokens
         self.num_out_tokens = self.num_out_tokens_after_drop
