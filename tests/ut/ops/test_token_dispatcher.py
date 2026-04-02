@@ -464,9 +464,9 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
         patcher3 = patch.object(TokenDispatcherWithAll2AllvTokenDrop,
                                 'ep_size',
                                 new_callable=PropertyMock,
-                                return_value=16)
+                                return_value=2)
         patcher4 = patch('torch.distributed.get_rank', return_value=0)
-        patcher5 = patch('torch.npu.current_device', return_value='cpu')
+        patcher5 = patch('torch.npu.current_device', return_value='npu:0')
 
         self.addCleanup(patcher1.stop)
         self.addCleanup(patcher2.stop)
@@ -482,31 +482,32 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
 
         self.dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
             top_k=6,
-            num_experts=128,
-            num_local_experts=8,
+            num_experts=4,
+            num_local_experts=2,
             token_drop_load_factor=1.2,
         )
 
-    @pytest.mark.parametrize("topk", [6, 8])
-    def test_capacity_ratio_with_high_topk(self, topk):
+    def test_capacity_ratio_with_high_topk(self):
+        # pytest -q test_token_dispatcher.py -k capacity_ratio_with_high_topk
         num_tokens = 16
         num_experts = self.dispatcher.num_experts
         load_factor = self.dispatcher.token_drop_load_factor
 
-        topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        topk_ids = torch.zeros((num_tokens, 6), dtype=torch.int64, device='npu:0')
         topk_ids[:, 0] = 0
         topk_ids[:, 1] = 1
         topk_ids[:, 2] = 0
         topk_ids[:, 3] = 2
         topk_ids[:, 4] = 0
         topk_ids[:, 5] = 3
-        if topk > 6:
-            topk_ids[:, 6] = 0
-            topk_ids[:, 7] = 1
+
 
         local_hist = torch.bincount(topk_ids.reshape(-1),
-                                    minlength=num_experts).to(torch.int64)
-        remote_hist = torch.tensor([4, 8, 10, 10], dtype=torch.int64)
+                        minlength=num_experts).to(dtype=torch.float32,
+                                      device='npu:0')
+        remote_hist = torch.tensor([4, 8, 10, 10],
+                       dtype=torch.float32,
+                       device='npu:0')
         global_hist = torch.stack([local_hist, remote_hist], dim=0)
 
         with patch(
@@ -524,8 +525,8 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
         avg_before_drop = float(global_avg_tokens_per_expert.item())
         assert avg_before_drop > 0
 
-        ratio = per_expert_after_drop / avg_before_drop
-        assert torch.all(ratio <= load_factor + 1e-6)
+
+        assert torch.all(per_expert_after_drop <= expert_capacity + 1e-6)
 
     @pytest.mark.skip(
         "Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")

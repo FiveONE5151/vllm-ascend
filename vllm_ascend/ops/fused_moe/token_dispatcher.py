@@ -23,7 +23,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import math
-from typing import Optional, overload, override
+from typing import Optional
+from typing_extensions import override
 
 import torch
 import torch_npu
@@ -671,17 +672,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         Returns:
             kept: shape [ep_size, num_experts], num of global tokens kept for each expert (global experts)
         """
-        kept = torch.zeros_like(num_global_tokens_per_expert)
-        for expert_idx in range(self.num_experts):
-            remain = expert_capacity
-            for rank_idx in range(self.ep_size):
-                current = int(num_global_tokens_per_expert[rank_idx, expert_idx].item())
-                if remain <= 0 or current <= 0:
-                    continue
-                keep_now = min(current, remain)
-                kept[rank_idx, expert_idx] = keep_now
-                remain -= keep_now
-        return kept
+        counts = num_global_tokens_per_expert.to(torch.int64)
+        prefix_before_rank = torch.cumsum(counts, dim=0) - counts
+        remain_before_rank = torch.clamp(expert_capacity - prefix_before_rank,
+                                         min=0)
+        return torch.minimum(counts, remain_before_rank)
 
     def _get_local_permute_keep_indices(
             self,
