@@ -488,7 +488,7 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
         )
 
     def test_capacity_ratio_with_high_topk(self):
-        # pytest -q test_token_dispatcher.py -k capacity_ratio_with_high_topk
+        # pytest tests/ut/ops/test_token_dispatcher.py -k capacity_ratio_with_high_topk -q -s
         num_tokens = 16
         num_experts = self.dispatcher.num_experts
         load_factor = self.dispatcher.token_drop_load_factor
@@ -524,9 +524,166 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
 
         avg_before_drop = float(global_avg_tokens_per_expert.item())
         assert avg_before_drop > 0
-
+        print(f"Token distribution before drop:\n{global_before_drop}")
+        print(f"Expert capacity: {expert_capacity}")
+        print(f"Token distribution after drop:\n{per_expert_after_drop}")
 
         assert torch.all(per_expert_after_drop <= expert_capacity + 1e-6)
+
+    def test_drop_by_score_respects_capacity_for_various_configs(self):
+        cases = [
+            (4, 2, 24, 6),
+            (6, 3, 18, 4),
+            (8, 4, 16, 3),
+            (4, 1, 1, 0),
+            (8, 1, 2, 0),
+        ]
+
+        for num_experts, topk, num_tokens, expert_capacity in cases:
+            dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+                top_k=topk,
+                num_experts=num_experts,
+                num_local_experts=2,
+                token_drop_load_factor=1.2,
+            )
+
+            subset_size = min(num_experts, max(topk + 1, 2))
+            row_offsets = torch.arange(num_tokens,
+                                       dtype=torch.int64,
+                                       device='npu:0').unsqueeze(-1)
+            col_offsets = torch.arange(topk,
+                                       dtype=torch.int64,
+                                       device='npu:0').unsqueeze(0)
+            topk_ids = (row_offsets + col_offsets) % subset_size
+            topk_weights = torch.rand((num_tokens, topk),
+                                      dtype=torch.float32,
+                                      device='npu:0')
+
+            out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop(
+                topk_ids, topk_weights, expert_capacity)
+
+            valid_mask = out_ids < num_experts
+            kept_counts = torch.bincount(out_ids[valid_mask].reshape(-1),
+                                         minlength=num_experts)
+
+            assert out_ids.shape == topk_ids.shape
+            assert out_weights.shape == topk_weights.shape
+            assert torch.all(kept_counts <= expert_capacity)
+            assert torch.all(out_weights[~valid_mask] == 0)
+            assert torch.all(out_ids[valid_mask] == topk_ids[valid_mask])
+
+    def test_preprocess_shapes_and_invariants_for_various_ep_topk(self):
+        cases = [
+            (4, 2, 2, 12),
+            (6, 3, 3, 10),
+            (8, 4, 2, 9),
+            (4, 4, 1, 1),
+            (8, 8, 1, 2),
+        ]
+
+        for num_experts, ep_size, topk, num_tokens in cases:
+            num_local_experts = num_experts // ep_size
+            assert num_local_experts > 0
+
+            mock_ep_group = MagicMock()
+            mock_ep_group._get_backend.return_value.get_hccl_comm_name.return_value = "hccl_123"
+
+            def _all_gatherv(x, *args, **kwargs):
+                return torch.cat([x] * ep_size, dim=0)
+
+            mock_ep_group.all_gatherv.side_effect = _all_gatherv
+
+            with patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                              'ep_group',
+                              new_callable=PropertyMock,
+                              return_value=mock_ep_group), \
+                 patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                              'ep_rank',
+                              new_callable=PropertyMock,
+                              return_value=0), \
+                 patch.object(TokenDispatcherWithAll2AllvTokenDrop,
+                              'ep_size',
+                              new_callable=PropertyMock,
+                              return_value=ep_size), \
+                 patch('torch.distributed.get_rank', return_value=0), \
+                 patch('torch.npu.current_device', return_value='npu:0'):
+
+                dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+                    top_k=topk,
+                    num_experts=num_experts,
+                    num_local_experts=num_local_experts,
+                    token_drop_load_factor=1.1,
+                )
+
+                topk_ids = torch.arange(num_tokens * topk,
+                                        device='npu:0').reshape(
+                                            num_tokens,
+                                            topk) % num_experts
+                topk_ids = topk_ids.to(torch.int64)
+                topk_weights = torch.rand((num_tokens, topk),
+                                          dtype=torch.float32,
+                                          device='npu:0')
+
+                forward_context = MagicMock()
+                forward_context.dp_metadata.num_tokens_across_dp_cpu = torch.full(
+                    (ep_size, ), num_tokens, dtype=torch.int64)
+                local_hist = torch.bincount(topk_ids.reshape(-1),
+                                            minlength=num_experts).to(
+                                                torch.int64)
+                global_hist = torch.stack([local_hist] * ep_size,
+                                          dim=0).reshape(-1)
+
+                with patch(
+                        'vllm_ascend.ops.fused_moe.token_dispatcher.get_forward_context',
+                        return_value=forward_context), patch(
+                            'vllm_ascend.ops.fused_moe.token_dispatcher.gather_from_sequence_parallel_region',
+                            return_value=global_hist):
+                    (num_tokens_per_local_expert, input_splits, output_splits,
+                     num_global_tokens_per_local_expert,
+                     global_input_tokens_local_experts_indices,
+                     local_permute_keep_indices, expert_capacity,
+                     global_avg_tokens_per_expert,
+                     num_global_tokens_per_expert_before_drop
+                     ) = dispatcher._preprocess_with_token_drop(
+                         topk_ids, topk_weights)
+
+            assert num_tokens_per_local_expert.shape == (num_local_experts, )
+            assert input_splits.shape[0] == ep_size
+            assert output_splits.shape[0] == ep_size
+            assert num_global_tokens_per_local_expert.shape == (
+                ep_size, num_local_experts)
+            assert num_global_tokens_per_expert_before_drop.shape == (
+                ep_size, num_experts)
+            if num_local_experts > 1:
+                assert global_input_tokens_local_experts_indices is not None
+                assert global_input_tokens_local_experts_indices.numel() == \
+                    int(num_global_tokens_per_local_expert.sum().item())
+            assert local_permute_keep_indices.dtype == torch.int64
+            assert local_permute_keep_indices.numel() <= topk_ids.numel()
+            assert expert_capacity >= 0
+            assert float(global_avg_tokens_per_expert.item()) >= 0
+            assert int(input_splits.sum()) == int(local_permute_keep_indices.numel())
+
+    def test_drop_by_score_extreme_all_dropped_and_single_path(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=1,
+            num_experts=4,
+            num_local_experts=2,
+            token_drop_load_factor=0.0,
+        )
+
+        topk_ids = torch.tensor([[0], [1], [2], [3]],
+                                dtype=torch.int64,
+                                device='npu:0')
+        topk_weights = torch.tensor([[0.9], [0.8], [0.7], [0.6]],
+                                    dtype=torch.float32,
+                                    device='npu:0')
+
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop(
+            topk_ids, topk_weights, expert_capacity=0)
+
+        assert torch.all(out_ids == dispatcher.num_experts)
+        assert torch.all(out_weights == 0)
 
     @pytest.mark.skip(
         "Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
