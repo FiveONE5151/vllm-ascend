@@ -40,6 +40,7 @@ from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
 
 from vllm.forward_context import get_forward_context
 import os
+from vllm.logger import logger
 @dataclass
 class TokenDispatchResult:
     hidden_states: torch.Tensor
@@ -666,6 +667,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
+        self.drop_by_expert = os.getenv("VLLM_TOKEN_DROP_BY_EXPERT", "0") == "1"
+        self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
 
     def _rank_token_ranges(self, num_tokens_across_dp: torch.Tensor
                            ) -> list[tuple[int, int]]:
@@ -894,7 +897,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
                 remaining -= keep
         return kept
 
-    def _get_topk_ids_weights_after_drop(self, global_topk_ids: torch.Tensor, global_topk_weights: torch.Tensor, expert_capacity: int) -> torch.Tensor:
+    def _get_topk_ids_weights_after_drop_by_expert(self, global_topk_ids: torch.Tensor, global_topk_weights: torch.Tensor, expert_capacity: int) -> torch.Tensor:
         mask_buffer = torch.zeros((global_topk_ids.shape[0], self.num_experts),
                                   dtype=torch.bool,
                                   device=global_topk_ids.device)
@@ -943,6 +946,91 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         # 把最终被选中但超过容量限制的位置的expert index设置为num_experts (sentinel)，表示这些token将被丢弃
         global_topk_ids = global_topk_ids.masked_fill(~top_mask, self.num_experts)
 
+        return global_topk_weights, global_topk_ids
+
+    def _get_topk_ids_weights_after_drop_by_device(self, global_topk_ids: torch.Tensor, global_topk_weights: torch.Tensor, device_capacity: int) -> torch.Tensor:
+        if global_topk_ids.numel() == 0:
+            return global_topk_weights, global_topk_ids
+
+        if device_capacity <= 0:
+            return (torch.zeros_like(global_topk_weights),
+                    torch.full_like(global_topk_ids, self.num_experts))
+
+        flat_topk_ids = global_topk_ids.reshape(-1).to(torch.int64)
+        flat_topk_weights = global_topk_weights.reshape(-1)
+
+        device_ids_all = torch.div(flat_topk_ids,
+                                   self.num_local_experts,
+                                   rounding_mode='floor')
+
+        # 1) sort by score(desc), 2) stable sort by device id(asc).
+        # After these two sorts, assignments in each device are already ordered
+        # by score(desc), so we can keep the first `device_capacity` per device.
+
+        # [num_global_tokens*topk,], the indices that would sort the scores in descending order
+        score_order = torch.argsort(flat_topk_weights, descending=True)
+
+        # [num_global_tokens*topk,], flattened assignment indices sorted by score(desc)
+        sorted_scores_indices = score_order
+
+        # [num_global_tokens*topk,], the device ids of the flat topk ids, sorted by score(desc)
+        # TODO: can be optimized by avoiding the sort and directly get the topk indices for each device?
+        sorted_device_ids = device_ids_all.index_select(0, score_order)
+
+        # [num_global_tokens*topk,], the indices that would sort the device ids in ascending order
+        # since itis stable, the relative order of tokens with the same device id (sorted by score desc) will be kept
+        device_order = torch.argsort(sorted_device_ids, stable=True)
+
+        # [ num_global_tokens*topk,], the flat topk ids sorted by score(desc) and then stable sorted by device id(asc)
+        sorted_indices = sorted_scores_indices.index_select(0, device_order)
+        sorted_device_ids = sorted_device_ids.index_select(0, device_order)
+
+        sorted_len = sorted_device_ids.shape[0]
+
+        # [num_global_tokens*topk,]
+        # [0,1,2,..., num_global_tokens*topk-1]
+        arange_sorted = torch.arange(sorted_len,
+                                     device=sorted_device_ids.device,
+                                     dtype=torch.int64)
+
+        group_start_flags = torch.ones_like(sorted_device_ids, dtype=torch.bool)
+
+        # indicates the start offset in T*K of each device
+        # [1,0,0,0,1,0,0,1,0,0] -> device0: [0,1,2,3], device1: [4,5,6], device2: [7,8,9]
+        group_start_flags[1:] = sorted_device_ids[1:] != sorted_device_ids[:-1]
+
+        # [ep_size,], the start offset of each device's tokens in the sorted token sequence
+        # [0,4,7]
+        group_starts = arange_sorted[group_start_flags]
+
+        # [num_global_tokens*topk,], the device id of each token in the sorted token sequence
+        # [0,0,0,0,1,1,1,2,2,2]
+        group_ids = torch.cumsum(group_start_flags.to(torch.int64), dim=0) - 1
+
+        # [num_global_tokens*topk,]
+        # the rank of each token within its device in the sorted token sequence
+        # [0,1,2,3,0,1,2,0,1,2]
+        rank_in_device = arange_sorted - group_starts.index_select(0, group_ids)
+
+        # [num_global_tokens*topk,], 
+        # whether each token is within the capacity limit of its device
+        keep_in_sorted = rank_in_device < device_capacity
+
+        # [num_tokens_kept], 
+        # the indices of tokens that are within the capacity limit of their devices in the sorted token sequence
+        kept_indices = sorted_indices.index_select(
+            0, torch.nonzero(keep_in_sorted, as_tuple=False).squeeze(-1))
+        keep_mask_flat = torch.zeros_like(flat_topk_ids,
+                                          dtype=torch.bool,
+                                          device=flat_topk_ids.device)
+        # [num_tokens_kept,]，把被保留的token位置标记为True
+        keep_mask_flat.scatter_(0, kept_indices, True)
+
+        keep_mask = keep_mask_flat.view_as(global_topk_ids)
+        global_topk_weights = global_topk_weights * keep_mask.to(
+            global_topk_weights.dtype)
+        global_topk_ids = global_topk_ids.masked_fill(~keep_mask,
+                                                       self.num_experts)
         return global_topk_weights, global_topk_ids
 
     def _preprocess_with_token_drop(self,
@@ -999,11 +1087,20 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             float(self.num_experts))
         expert_capacity = math.ceil(global_topk_ids.shape[0] * self.top_k * self.token_drop_load_factor / self.num_experts)
 
+        device_capacity = math.ceil(expert_capacity * self.num_local_experts)
+
         ###
         # drop tokens according to topk weights, get the topk_ids after drop
-        global_topk_weights_after_drop, global_topk_ids_after_drop = \
-            self._get_topk_ids_weights_after_drop(global_topk_ids, 
-                                                  global_topk_weights, expert_capacity)
+        if self.drop_by_expert:
+            global_topk_weights_after_drop, global_topk_ids_after_drop = \
+                self._get_topk_ids_weights_after_drop_by_expert(global_topk_ids, 
+                                                    global_topk_weights, expert_capacity)
+        else:
+             # TODO: implement token drop by device, 
+             # which directly drop tokens on each device according to the device capacity
+             global_topk_weights_after_drop, global_topk_ids_after_drop = \
+                self._get_topk_ids_weights_after_drop_by_device(global_topk_ids, 
+                                                    global_topk_weights, device_capacity)
         ###
 
         num_global_tokens_per_expert_after_drop = self._compute_num_global_tokens_per_expert_after_drop(
@@ -1055,12 +1152,22 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             topk_ids.device,
         )
 
-        if os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1" and self.ep_rank == 0:
+        if self.token_drop_logging and self.ep_rank == 0:
             max_expert_load_before_drop = num_global_tokens_per_expert.sum(
                 dim=0).max().item()
             max_expert_load_after_drop = num_global_tokens_per_expert_after_drop.sum(
                 dim=0).max().item()
-            print(f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Max expert load before drop: {max_expert_load_before_drop}, after drop: {max_expert_load_after_drop}, expert capacity: {expert_capacity}, num_out_tokens_before_drop: {self.num_out_tokens}, num_out_tokens_after_drop: {self.num_out_tokens_after_drop}")
+            logger.info(f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Max expert load before drop: {max_expert_load_before_drop}, after drop: {max_expert_load_after_drop}, expert capacity: {expert_capacity}")
+            recv_load_per_rank_before_drop = num_global_tokens_per_expert.reshape(
+                self.ep_size, self.ep_size, self.num_local_experts).sum(dim=(0, 2))
+            recv_load_per_rank_after_drop = num_global_tokens_per_expert_after_drop.reshape(
+                self.ep_size, self.ep_size, self.num_local_experts).sum(dim=(0, 2))
+            max_device_load_before_drop = recv_load_per_rank_before_drop.max().item()
+            max_device_load_after_drop = recv_load_per_rank_after_drop.max().item()
+            logger.info(
+                f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Recv load per rank before drop: {recv_load_per_rank_before_drop.tolist()}, "
+                f"after drop: {recv_load_per_rank_after_drop.tolist()}, max before: {max_device_load_before_drop}, "
+                f"max after: {max_device_load_after_drop}, device capacity: {device_capacity}")
 
 
         return (

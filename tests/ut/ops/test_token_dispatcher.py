@@ -559,7 +559,7 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
                                       dtype=torch.float32,
                                       device='npu:0')
 
-            out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop(
+            out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_expert(
                 topk_ids, topk_weights, expert_capacity)
 
             valid_mask = out_ids < num_experts
@@ -572,6 +572,192 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
             assert torch.all(out_weights[~valid_mask] == 0)
             assert torch.all(out_ids[valid_mask] == topk_ids[valid_mask])
 
+    def test_drop_by_device_respects_capacity_for_various_configs(self):
+        cases = [
+            # (num_experts, num_local_experts, topk, num_tokens, device_capacity)
+            (4, 2, 2, 24, 10),
+            (8, 2, 4, 16, 12),
+            (8, 4, 2, 20, 8),
+            (4, 2, 1, 6, 2),
+            (128, 8, 8, 128, 56),
+        ]
+
+        for num_experts, num_local_experts, topk, num_tokens, device_capacity in cases:
+            dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+                top_k=topk,
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                token_drop_load_factor=1.2,
+            )
+
+            subset_size = min(num_experts, max(topk + 1, 2))
+            row_offsets = torch.arange(num_tokens,
+                                       dtype=torch.int64,
+                                       device='npu:0').unsqueeze(-1)
+            col_offsets = torch.arange(topk,
+                                       dtype=torch.int64,
+                                       device='npu:0').unsqueeze(0)
+            topk_ids = (row_offsets + col_offsets) % subset_size
+            topk_weights = torch.rand((num_tokens, topk),
+                                      dtype=torch.float32,
+                                      device='npu:0')
+
+            out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_device(
+                topk_ids, topk_weights, device_capacity)
+
+            valid_mask = out_ids < num_experts
+            num_devices = num_experts // num_local_experts
+            kept_device_counts = torch.bincount(
+                (out_ids[valid_mask] // num_local_experts).reshape(-1),
+                minlength=num_devices)
+
+            assert out_ids.shape == topk_ids.shape
+            assert out_weights.shape == topk_weights.shape
+            assert torch.all(kept_device_counts <= device_capacity)
+            assert torch.all(out_weights[~valid_mask] == 0)
+            assert torch.all(out_ids[valid_mask] == topk_ids[valid_mask])
+
+    def test_drop_by_device_large_ep_config(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=8,
+            num_experts=128,
+            num_local_experts=8,
+            token_drop_load_factor=1.2,
+        )
+
+        num_tokens = 256
+        topk = 8
+        device_capacity = 96
+
+        topk_ids = torch.randint(0,
+                                 dispatcher.num_experts,
+                                 (num_tokens, topk),
+                                 dtype=torch.int64,
+                                 device='npu:0')
+        topk_weights = torch.rand((num_tokens, topk),
+                                  dtype=torch.float32,
+                                  device='npu:0')
+
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_device(
+            topk_ids, topk_weights, device_capacity)
+
+        valid_mask = out_ids < dispatcher.num_experts
+        num_devices = dispatcher.num_experts // dispatcher.num_local_experts
+        kept_device_counts = torch.bincount(
+            (out_ids[valid_mask] // dispatcher.num_local_experts).reshape(-1),
+            minlength=num_devices)
+
+        assert out_ids.shape == topk_ids.shape
+        assert out_weights.shape == topk_weights.shape
+        assert torch.all(kept_device_counts <= device_capacity)
+        assert torch.all(out_weights[~valid_mask] == 0)
+
+    def test_drop_by_device_exact_topscore_assignments_large_ep(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=8,
+            num_experts=128,
+            num_local_experts=8,
+            token_drop_load_factor=1.2,
+        )
+
+        num_tokens = 256
+        topk = 8
+        device_capacity = 5
+
+        # Deterministic ids and strictly unique scores for exact-set validation.
+        # 严格每个专家16个token
+        flat_ids = torch.arange(num_tokens * topk,
+                                dtype=torch.int64,
+                                device='npu:0') % dispatcher.num_experts
+        topk_ids = flat_ids.view(num_tokens, topk)
+        topk_weights = torch.arange(num_tokens * topk,
+                                    dtype=torch.float32,
+                                    device='npu:0').view(num_tokens, topk)
+
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_device(
+            topk_ids, topk_weights, device_capacity)
+
+        flat_device_ids = (topk_ids.reshape(-1) //
+                           dispatcher.num_local_experts).to(torch.int64)
+        flat_scores = topk_weights.reshape(-1)
+        expected_keep_flat = torch.zeros_like(flat_scores, dtype=torch.bool)
+
+        num_devices = dispatcher.num_experts // dispatcher.num_local_experts
+        for device_id in range(num_devices):
+            device_mask = (flat_device_ids == device_id)
+            device_indices = torch.nonzero(device_mask,
+                                           as_tuple=False).squeeze(-1)
+            if device_indices.numel() == 0:
+                continue
+            k = min(device_capacity, int(device_indices.numel()))
+            device_scores = flat_scores.index_select(0, device_indices)
+            _, keep_local = torch.topk(device_scores,
+                                       k=k,
+                                       dim=0,
+                                       sorted=False)
+            keep_indices = device_indices.index_select(0, keep_local)
+            expected_keep_flat.scatter_(0, keep_indices, True)
+
+        expected_keep = expected_keep_flat.view_as(topk_ids)
+        actual_keep = out_ids < dispatcher.num_experts
+
+        assert torch.equal(actual_keep, expected_keep)
+        assert torch.all(out_ids[actual_keep] == topk_ids[actual_keep])
+        assert torch.all(out_weights[actual_keep] == topk_weights[actual_keep])
+        assert torch.all(out_ids[~actual_keep] == dispatcher.num_experts)
+        assert torch.all(out_weights[~actual_keep] == 0)
+
+    def test_drop_by_expert_exact_topscore_assignments_large_ep(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=8,
+            num_experts=128,
+            num_local_experts=8,
+            token_drop_load_factor=1.2,
+        )
+
+        num_tokens = 256
+        topk = 8
+        expert_capacity = 3
+
+        # Deterministic ids and strictly unique scores for exact-set validation.
+        flat_ids = torch.arange(num_tokens * topk,
+                                dtype=torch.int64,
+                                device='npu:0') % dispatcher.num_experts
+        topk_ids = flat_ids.view(num_tokens, topk)
+        topk_weights = torch.arange(num_tokens * topk,
+                                    dtype=torch.float32,
+                                    device='npu:0').view(num_tokens, topk)
+
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_expert(
+            topk_ids, topk_weights, expert_capacity)
+
+        flat_scores = topk_weights.reshape(-1)
+        expected_keep_flat = torch.zeros_like(flat_scores, dtype=torch.bool)
+
+        for expert_id in range(dispatcher.num_experts):
+            expert_mask = (topk_ids.reshape(-1) == expert_id)
+            expert_indices = torch.nonzero(expert_mask,
+                                           as_tuple=False).squeeze(-1)
+            if expert_indices.numel() == 0:
+                continue
+            k = min(expert_capacity, int(expert_indices.numel()))
+            expert_scores = flat_scores.index_select(0, expert_indices)
+            _, keep_local = torch.topk(expert_scores,
+                                       k=k,
+                                       dim=0,
+                                       sorted=False)
+            keep_indices = expert_indices.index_select(0, keep_local)
+            expected_keep_flat.scatter_(0, keep_indices, True)
+
+        expected_keep = expected_keep_flat.view_as(topk_ids)
+        actual_keep = out_ids < dispatcher.num_experts
+
+        assert torch.equal(actual_keep, expected_keep)
+        assert torch.all(out_ids[actual_keep] == topk_ids[actual_keep])
+        assert torch.all(out_weights[actual_keep] == topk_weights[actual_keep])
+        assert torch.all(out_ids[~actual_keep] == dispatcher.num_experts)
+        assert torch.all(out_weights[~actual_keep] == 0)
+
     def test_preprocess_shapes_and_invariants_for_various_ep_topk(self):
         cases = [
             (4, 2, 2, 12),
@@ -579,6 +765,7 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
             (8, 4, 2, 9),
             (4, 4, 1, 1),
             (8, 8, 1, 2),
+            (128, 16, 8, 32),
         ]
 
         for num_experts, ep_size, topk, num_tokens in cases:
@@ -679,8 +866,30 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
                                     dtype=torch.float32,
                                     device='npu:0')
 
-        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop(
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_expert(
             topk_ids, topk_weights, expert_capacity=0)
+
+        assert torch.all(out_ids == dispatcher.num_experts)
+        assert torch.all(out_weights == 0)
+
+    def test_drop_by_device_extreme_all_dropped_and_single_path(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=2,
+            num_experts=4,
+            num_local_experts=2,
+            token_drop_load_factor=0.0,
+        )
+
+        topk_ids = torch.tensor([[0, 1], [2, 3], [1, 2], [0, 3]],
+                                dtype=torch.int64,
+                                device='npu:0')
+        topk_weights = torch.tensor([[0.9, 0.8], [0.7, 0.6], [0.5, 0.4],
+                                     [0.3, 0.2]],
+                                    dtype=torch.float32,
+                                    device='npu:0')
+
+        out_weights, out_ids = dispatcher._get_topk_ids_weights_after_drop_by_device(
+            topk_ids, topk_weights, device_capacity=0)
 
         assert torch.all(out_ids == dispatcher.num_experts)
         assert torch.all(out_weights == 0)
