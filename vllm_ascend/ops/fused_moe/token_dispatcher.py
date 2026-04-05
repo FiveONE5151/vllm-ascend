@@ -39,7 +39,7 @@ from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                is_hierarchical_communication_enabled)
 
 from vllm.forward_context import get_forward_context
-
+import os
 @dataclass
 class TokenDispatchResult:
     hidden_states: torch.Tensor
@@ -997,7 +997,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         global_avg_tokens_per_expert = (
             num_global_tokens_per_expert.sum().to(torch.float32) /
             float(self.num_experts))
-        expert_capacity = math.ceil(num_tokens_across_dp.sum().item() * self.top_k * self.token_drop_load_factor / self.num_experts)
+        expert_capacity = math.ceil(global_topk_ids.shape[0] * self.top_k * self.token_drop_load_factor / self.num_experts)
 
         ###
         # drop tokens according to topk weights, get the topk_ids after drop
@@ -1054,6 +1054,13 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             num_local_tokens_per_expert,
             topk_ids.device,
         )
+
+        if os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1" and self.ep_rank == 0:
+            max_expert_load_before_drop = num_global_tokens_per_expert.sum(
+                dim=0).max().item()
+            max_expert_load_after_drop = num_global_tokens_per_expert_after_drop.sum(
+                dim=0).max().item()
+            print(f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Max expert load before drop: {max_expert_load_before_drop}, after drop: {max_expert_load_after_drop}, expert capacity: {expert_capacity}, num_out_tokens_before_drop: {self.num_out_tokens}, num_out_tokens_after_drop: {self.num_out_tokens_after_drop}")
 
 
         return (

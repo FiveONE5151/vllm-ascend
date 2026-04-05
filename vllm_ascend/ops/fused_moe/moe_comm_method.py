@@ -38,7 +38,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher, TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAll2AllvTokenDrop,
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
-
+from vllm.logger import logger
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
 
 
@@ -253,6 +253,7 @@ class AlltoAllCommImpl(MoECommMethod):
 
     def _get_token_dispatcher(self):
         if envs_ascend.VLLM_ENABLE_TOKEN_DROP:
+            logger.info(f"[YIWU] [token drop] Using TokenDispatcherWithAll2AllvTokenDrop with load factor {envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR}")
             return TokenDispatcherWithAll2AllvTokenDrop(
                 top_k=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,

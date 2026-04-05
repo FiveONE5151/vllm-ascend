@@ -57,7 +57,7 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import \
             get_moe_comm_method
         moe_comm_type = select_moe_comm_method(num_tokens, vllm_config,
-                                               is_draft_model)
+                                               is_draft_model, aclgraph_runtime_mode)
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -208,7 +208,8 @@ def get_mc2_mask():
 
 def select_moe_comm_method(num_tokens: int,
                            vllm_config: VllmConfig,
-                           is_draft_model=False) -> Optional[MoECommType]:
+                           is_draft_model=False,
+                           aclgraph_runtime_mode=CUDAGraphMode.NONE) -> Optional[MoECommType]:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
 
@@ -224,6 +225,7 @@ def select_moe_comm_method(num_tokens: int,
         num_tokens (int): The number of tokens in the current batch.
         vllm_config (VllmConfig): Runtime configuration for the model.
         is_draft_model (bool): Whether the model runs in MTP mode (disables fused MC2).
+        aclgraph_runtime_mode (CUDAGraphMode): The runtime mode for ACL graph.
 
     Raises:
         ValueError: If the soc version is unsupported.
@@ -276,7 +278,10 @@ def select_moe_comm_method(num_tokens: int,
         #         fused_prefill_enable = False
         #     moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
         # TODO: hack
-        moe_comm_type = MoECommType.ALLTOALL
+        if aclgraph_runtime_mode != CUDAGraphMode.NONE:
+            moe_comm_type = MoECommType.MC2
+        else:
+            moe_comm_type = MoECommType.ALLTOALL
 
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
