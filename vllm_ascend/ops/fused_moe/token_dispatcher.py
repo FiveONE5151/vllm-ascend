@@ -670,6 +670,9 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         self.drop_by_expert = os.getenv("VLLM_TOKEN_DROP_BY_EXPERT", "0") == "1"
         self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
 
+        logger.info(f"[TokenDrop]Initialized TokenDispatcherWithAll2AllvTokenDrop with token_drop_load_factor={self.token_drop_load_factor}, ")
+        logger.info(f"[TokenDrop]drop_by_expert={self.drop_by_expert}, token_drop_logging={self.token_drop_logging}")
+
     def _rank_token_ranges(self, num_tokens_across_dp: torch.Tensor
                            ) -> list[tuple[int, int]]:
         token_prefix = torch.cumsum(num_tokens_across_dp.to(torch.int64), dim=0)
@@ -975,7 +978,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
         # [num_global_tokens*topk,], the device ids of the flat topk ids, sorted by score(desc)
         # TODO: can be optimized by avoiding the sort and directly get the topk indices for each device?
-        sorted_device_ids = device_ids_all.index_select(0, score_order)
+        # cast to fp32 to run argsort on aicore
+        sorted_device_ids = device_ids_all.index_select(0, score_order).to(dtype=torch.float32)
 
         # [num_global_tokens*topk,], the indices that would sort the device ids in ascending order
         # since itis stable, the relative order of tokens with the same device id (sorted by score desc) will be kept
