@@ -668,13 +668,17 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
+        self.token_drop_local_only = kwargs.get("token_drop_local_only",
+                                                False)
         self.drop_by_expert = os.getenv("VLLM_TOKEN_DROP_BY_EXPERT", "0") == "1"
         self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
         self.token_drop_csv_dir = os.getenv("VLLM_TOKEN_DROP_CSV_DIR", "")
         self.token_drop_step = 0
 
         logger.info(f"[TokenDrop]Initialized TokenDispatcherWithAll2AllvTokenDrop with token_drop_load_factor={self.token_drop_load_factor}, ")
-        logger.info(f"[TokenDrop]drop_by_expert={self.drop_by_expert}, token_drop_logging={self.token_drop_logging}")
+        logger.info(
+            f"[TokenDrop]drop_by_expert={self.drop_by_expert}, token_drop_logging={self.token_drop_logging}, token_drop_local_only={self.token_drop_local_only}"
+        )
 
     def _log_token_drop_statistics(
             self,
@@ -684,6 +688,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             device_capacity: int,
             step: int) -> None:
         if self.ep_rank != 0:
+            return
+        if get_forward_context().in_profile_run:
             return
 
         expert_load_before = num_global_tokens_per_expert_before_drop.sum(
@@ -1137,6 +1143,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
                                     topk_ids: torch.Tensor,
                                     topk_weights: Optional[torch.Tensor] = None,
                                     step: int = 0):
+        if self.token_drop_local_only:
+            return self._preprocess_with_token_drop_local(topk_ids,
+                                                          topk_weights,
+                                                          step)
+
         if topk_weights is None:
             topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         num_local_tokens_per_expert = torch.histc(topk_ids,
@@ -1263,6 +1274,121 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
                 step=step,
             )
 
+
+        return (
+            num_tokens_per_local_expert,
+            input_splits.numpy(),
+            output_splits.numpy(),
+            num_global_tokens_per_local_expert,
+            global_input_tokens_local_experts_indices,
+            local_permute_keep_indices,
+            expert_capacity,
+            global_avg_tokens_per_expert,
+            num_global_tokens_per_expert,
+        )
+
+    def _preprocess_with_token_drop_local(
+            self,
+            topk_ids: torch.Tensor,
+            topk_weights: Optional[torch.Tensor] = None,
+            step: int = 0):
+
+        num_local_tokens_per_expert = torch.histc(topk_ids,
+                                                  bins=self.num_experts,
+                                                  min=0,
+                                                  max=self.num_experts).to(
+                                                      torch.int64)
+        ep_size = self.ep_size
+        self.num_out_tokens = topk_ids.numel()
+
+
+        num_tokens_across_dp = get_forward_context(
+        ).dp_metadata.num_tokens_across_dp_cpu
+
+
+        total_tokens = int(num_tokens_across_dp.sum().item())
+        expert_capacity = math.ceil(total_tokens * self.top_k *
+                                    self.token_drop_load_factor /
+                                    self.num_experts)
+        device_capacity = math.ceil(expert_capacity * self.num_local_experts)
+
+        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
+            num_local_tokens_per_expert,
+            group=self.ep_group).reshape(ep_size, self.num_experts).to(
+                torch.int64)
+
+        # Global average before drop only depends on total assignments.
+        global_avg_tokens_per_expert = torch.tensor(
+            float(total_tokens * self.top_k) / float(self.num_experts),
+            dtype=torch.float32,
+            device=topk_ids.device,
+        )
+
+        if not self.drop_by_expert:
+            logger.warning(
+                "[TokenDrop] local-only mode currently supports expert-based drop only; forcing expert strategy."
+            )
+
+        local_topk_weights_after_drop, local_topk_ids_after_drop = \
+            self._get_topk_ids_weights_after_drop_by_expert(
+                topk_ids,
+                topk_weights,
+                expert_capacity,
+            )
+
+        this_rank_kept_expert_ids = local_topk_ids_after_drop[
+            local_topk_ids_after_drop < self.num_experts]
+        num_local_tokens_per_expert_after_drop = torch.bincount(
+            this_rank_kept_expert_ids.reshape(-1),
+            minlength=self.num_experts,
+        ).to(torch.int64)
+
+        # Build drop-after global matrix from per-rank count vectors.
+        num_global_tokens_per_expert_after_drop = gather_from_sequence_parallel_region(
+            num_local_tokens_per_expert_after_drop,
+            group=self.ep_group).reshape(ep_size, self.num_experts).to(
+                torch.int64)
+
+        num_global_tokens_per_local_expert = num_global_tokens_per_expert_after_drop[:, self.local_expert_indices[
+            0]:self.local_expert_indices[-1] + 1]
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(
+            axis=0)
+
+        # Derive both splits from the same global after-drop matrix.
+        output_splits = num_global_tokens_per_local_expert.sum(axis=-1)
+        input_splits = num_global_tokens_per_expert_after_drop[
+            self.ep_rank].reshape(ep_size, self.num_local_experts).sum(axis=1)
+
+        output_splits = output_splits.to(device=torch.device("cpu"),
+                                         non_blocking=True)
+        input_splits = input_splits.to(device=torch.device("cpu"),
+                                       non_blocking=True)
+
+        global_input_tokens_local_experts_indices = None
+        if self.num_local_experts > 1:
+            global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.ravel())
+
+        self.num_out_tokens_after_drop = int(input_splits.sum().item())
+
+        local_permute_keep_indices = self._get_local_permute_keep_indices_from_topk(
+            topk_ids,
+            local_topk_ids_after_drop,
+            num_local_tokens_per_expert,
+            topk_ids.device,
+        )
+
+        if self.token_drop_logging:
+            self._log_token_drop_statistics(
+                num_global_tokens_per_expert_before_drop=
+                num_global_tokens_per_expert,
+                num_global_tokens_per_expert_after_drop=
+                num_global_tokens_per_expert_after_drop,
+                expert_capacity=expert_capacity,
+                device_capacity=device_capacity,
+                step=step,
+            )
 
         return (
             num_tokens_per_local_expert,

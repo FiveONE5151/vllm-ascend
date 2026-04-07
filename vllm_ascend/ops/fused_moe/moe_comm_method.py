@@ -258,7 +258,8 @@ class AlltoAllCommImpl(MoECommMethod):
                 top_k=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
-                token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR)
+                token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR,
+                token_drop_local_only=envs_ascend.VLLM_TOKEN_DROP_LOCAL_ONLY)
         return TokenDispatcherWithAll2AllV(
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,

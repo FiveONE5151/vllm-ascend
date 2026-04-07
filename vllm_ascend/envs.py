@@ -150,6 +150,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_TOKEN_DROP_LOGGING":
     lambda: bool(int(os.getenv("VLLM_TOKEN_DROP_LOGGING", '0'))),
 
+    "VLLM_TOKEN_DROP_LOCAL_ONLY":
+    lambda: bool(int(os.getenv("VLLM_TOKEN_DROP_LOCAL_ONLY", '0'))),
+
     ### [yiwu] end token drop related envs
 }
 

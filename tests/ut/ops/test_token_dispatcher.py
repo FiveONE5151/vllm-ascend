@@ -851,6 +851,94 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
             assert float(global_avg_tokens_per_expert.item()) >= 0
             assert int(input_splits.sum()) == int(local_permute_keep_indices.numel())
 
+    def test_preprocess_local_mode_no_topk_allgather_and_split_consistency(self):
+        dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
+            top_k=2,
+            num_experts=4,
+            num_local_experts=2,
+            token_drop_load_factor=1.0,
+            token_drop_local_only=True,
+        )
+
+        topk_ids = torch.tensor(
+            [[0, 1], [2, 3], [1, 2], [0, 3]],
+            dtype=torch.int64,
+            device='npu:0')
+        topk_weights = torch.tensor(
+            [[0.9, 0.8], [0.7, 0.6], [0.5, 0.4], [0.3, 0.2]],
+            dtype=torch.float32,
+            device='npu:0')
+
+        dropped_ids = torch.tensor(
+            [[0, 4], [2, 4], [1, 2], [4, 3]],
+            dtype=torch.int64,
+            device='npu:0')
+        dropped_weights = torch.where(dropped_ids < dispatcher.num_experts,
+                                      topk_weights,
+                                      torch.zeros_like(topk_weights))
+
+        local_before = torch.bincount(topk_ids.reshape(-1),
+                                      minlength=dispatcher.num_experts).to(
+                                          torch.int64)
+        local_after = torch.bincount(
+            dropped_ids[dropped_ids < dispatcher.num_experts].reshape(-1),
+            minlength=dispatcher.num_experts).to(torch.int64)
+        remote_before = torch.tensor([1, 2, 3, 2],
+                                     dtype=torch.int64,
+                                     device='npu:0')
+        remote_after = torch.tensor([2, 1, 1, 1],
+                                    dtype=torch.int64,
+                                    device='npu:0')
+        global_before = torch.stack([local_before, remote_before], dim=0)
+        global_after = torch.stack([local_after, remote_after], dim=0)
+
+        forward_context = MagicMock()
+        forward_context.dp_metadata.num_tokens_across_dp_cpu = torch.tensor(
+            [topk_ids.shape[0], topk_ids.shape[0]], dtype=torch.int64)
+
+        with patch(
+                'vllm_ascend.ops.fused_moe.token_dispatcher.get_forward_context',
+                return_value=forward_context), patch(
+                    'vllm_ascend.ops.fused_moe.token_dispatcher.gather_from_sequence_parallel_region',
+                    side_effect=[global_before.reshape(-1),
+                                 global_after.reshape(-1)]), patch(
+                                     'torch_npu.distributed.all_gather_into_tensor_uneven'
+                                 ) as mock_all_gather, patch.object(
+                                     TokenDispatcherWithAll2AllvTokenDrop,
+                                     '_get_topk_ids_weights_after_drop_by_expert',
+                                     return_value=(dropped_weights,
+                                                   dropped_ids)):
+            (num_tokens_per_local_expert, input_splits, output_splits,
+             num_global_tokens_per_local_expert,
+             global_input_tokens_local_experts_indices,
+             local_permute_keep_indices, _, _,
+             _) = dispatcher._preprocess_with_token_drop(
+                 topk_ids, topk_weights, step=1)
+
+        mock_all_gather.assert_not_called()
+
+        expected_output_splits = global_after[:, :dispatcher.num_local_experts]
+        expected_output_splits = expected_output_splits.sum(
+            dim=-1).cpu().numpy()
+        expected_input_splits = global_after[dispatcher.ep_rank].reshape(
+            dispatcher.ep_size, dispatcher.num_local_experts).sum(
+                dim=1).cpu().numpy()
+        expected_tokens_per_local_expert = global_after[:, :dispatcher.
+                                                        num_local_experts].sum(
+                                                            dim=0)
+
+        self.assertEqual(output_splits.tolist(), expected_output_splits.tolist())
+        self.assertEqual(input_splits.tolist(), expected_input_splits.tolist())
+        self.assertTrue(
+            torch.equal(num_tokens_per_local_expert,
+                        expected_tokens_per_local_expert))
+        if dispatcher.num_local_experts > 1:
+            self.assertIsNotNone(global_input_tokens_local_experts_indices)
+        self.assertEqual(int(input_splits.sum()),
+                         int(local_permute_keep_indices.numel()))
+        self.assertEqual(num_global_tokens_per_local_expert.shape,
+                         (dispatcher.ep_size, dispatcher.num_local_experts))
+
     def test_drop_by_score_extreme_all_dropped_and_single_path(self):
         dispatcher = TokenDispatcherWithAll2AllvTokenDrop(
             top_k=1,
