@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+import csv
 from dataclasses import dataclass, field
 import math
 from typing import Optional
@@ -669,9 +670,104 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
         self.drop_by_expert = os.getenv("VLLM_TOKEN_DROP_BY_EXPERT", "0") == "1"
         self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
+        self.token_drop_csv_dir = os.getenv("VLLM_TOKEN_DROP_CSV_DIR", "")
+        self.token_drop_step = 0
 
         logger.info(f"[TokenDrop]Initialized TokenDispatcherWithAll2AllvTokenDrop with token_drop_load_factor={self.token_drop_load_factor}, ")
         logger.info(f"[TokenDrop]drop_by_expert={self.drop_by_expert}, token_drop_logging={self.token_drop_logging}")
+
+    def _log_token_drop_statistics(
+            self,
+            num_global_tokens_per_expert_before_drop: torch.Tensor,
+            num_global_tokens_per_expert_after_drop: torch.Tensor,
+            expert_capacity: int,
+            device_capacity: int,
+            step: int) -> None:
+        if self.ep_rank != 0:
+            return
+
+        expert_load_before = num_global_tokens_per_expert_before_drop.sum(
+            dim=0).to(torch.int64)
+        expert_load_after = num_global_tokens_per_expert_after_drop.sum(
+            dim=0).to(torch.int64)
+
+        rank_load_before = num_global_tokens_per_expert_before_drop.reshape(
+            self.ep_size, self.ep_size, self.num_local_experts).sum(
+                dim=(0, 2)).to(torch.int64)
+        rank_load_after = num_global_tokens_per_expert_after_drop.reshape(
+            self.ep_size, self.ep_size, self.num_local_experts).sum(
+                dim=(0, 2)).to(torch.int64)
+
+        max_expert_before, max_expert_before_idx = torch.max(expert_load_before,
+                                                              dim=0)
+        max_expert_after, max_expert_after_idx = torch.max(expert_load_after,
+                                                            dim=0)
+        max_rank_before, max_rank_before_idx = torch.max(rank_load_before,
+                                                          dim=0)
+        max_rank_after, max_rank_after_idx = torch.max(rank_load_after, dim=0)
+
+        logger.info(
+            "[TokenDrop][step=%d] Max expert load before=%d (expert=%d), after=%d (expert=%d), expert_capacity=%d",
+            step,
+            int(max_expert_before.item()),
+            int(max_expert_before_idx.item()),
+            int(max_expert_after.item()),
+            int(max_expert_after_idx.item()),
+            int(expert_capacity),
+        )
+        logger.info(
+            "[TokenDrop][step=%d] Max rank load before=%d (rank=%d), after=%d (rank=%d), device_capacity=%d",
+            step,
+            int(max_rank_before.item()),
+            int(max_rank_before_idx.item()),
+            int(max_rank_after.item()),
+            int(max_rank_after_idx.item()),
+            int(device_capacity),
+        )
+
+        if not self.token_drop_csv_dir:
+            logger.warning(
+                "[TokenDrop][step=%d] CSV not written because VLLM_TOKEN_DROP_CSV_DIR is not set.",
+                step)
+            return
+
+        try:
+            os.makedirs(self.token_drop_csv_dir, exist_ok=True)
+            csv_path = os.path.join(
+                self.token_drop_csv_dir,
+                "token_drop_stats_rank0.csv")
+            should_write_header = (not os.path.exists(csv_path)
+                                   or os.path.getsize(csv_path) == 0)
+
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if should_write_header:
+                    writer.writerow([
+                        "step",
+                        "expert_id",
+                        "before_tokens",
+                        "after_tokens",
+                        "dropped_tokens",
+                        "capacity",
+                    ])
+
+                for expert_idx in range(self.num_experts):
+                    before_val = int(expert_load_before[expert_idx].item())
+                    after_val = int(expert_load_after[expert_idx].item())
+                    writer.writerow([
+                        step,
+                        expert_idx,
+                        before_val,
+                        after_val,
+                        before_val - after_val,
+                        int(expert_capacity),
+                    ])
+
+            logger.info("[TokenDrop][step=%d] CSV saved to: %s", step,
+                        csv_path)
+        except Exception as e:
+            logger.warning("[TokenDrop][step=%d] Failed to write CSV: %s",
+                           step, str(e))
 
     def _rank_token_ranges(self, num_tokens_across_dp: torch.Tensor
                            ) -> list[tuple[int, int]]:
@@ -1039,7 +1135,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
     def _preprocess_with_token_drop(self,
                                     topk_ids: torch.Tensor,
-                                    topk_weights: Optional[torch.Tensor] = None):
+                                    topk_weights: Optional[torch.Tensor] = None,
+                                    step: int = 0):
         if topk_weights is None:
             topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         num_local_tokens_per_expert = torch.histc(topk_ids,
@@ -1156,22 +1253,15 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             topk_ids.device,
         )
 
-        if self.token_drop_logging and self.ep_rank == 0:
-            max_expert_load_before_drop = num_global_tokens_per_expert.sum(
-                dim=0).max().item()
-            max_expert_load_after_drop = num_global_tokens_per_expert_after_drop.sum(
-                dim=0).max().item()
-            logger.info(f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Max expert load before drop: {max_expert_load_before_drop}, after drop: {max_expert_load_after_drop}, expert capacity: {expert_capacity}")
-            recv_load_per_rank_before_drop = num_global_tokens_per_expert.reshape(
-                self.ep_size, self.ep_size, self.num_local_experts).sum(dim=(0, 2))
-            recv_load_per_rank_after_drop = num_global_tokens_per_expert_after_drop.reshape(
-                self.ep_size, self.ep_size, self.num_local_experts).sum(dim=(0, 2))
-            max_device_load_before_drop = recv_load_per_rank_before_drop.max().item()
-            max_device_load_after_drop = recv_load_per_rank_after_drop.max().item()
-            logger.info(
-                f"[YIWU][TokenDispatcherWithAll2AllvTokenDrop] Recv load per rank before drop: {recv_load_per_rank_before_drop.tolist()}, "
-                f"after drop: {recv_load_per_rank_after_drop.tolist()}, max before: {max_device_load_before_drop}, "
-                f"max after: {max_device_load_after_drop}, device capacity: {device_capacity}")
+        if self.token_drop_logging:
+            self._log_token_drop_statistics(
+                num_global_tokens_per_expert_before_drop=num_global_tokens_per_expert,
+                num_global_tokens_per_expert_after_drop=
+                num_global_tokens_per_expert_after_drop,
+                expert_capacity=expert_capacity,
+                device_capacity=device_capacity,
+                step=step,
+            )
 
 
         return (
@@ -1218,6 +1308,8 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         """
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
+        self.token_drop_step += 1
+        step = self.token_drop_step
 
         assert self.hidden_shape is not None
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
@@ -1233,7 +1325,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             expert_capacity,
             global_avg_tokens_per_expert,
             num_global_tokens_per_expert_before_drop,
-        ) = self._preprocess_with_token_drop(topk_ids, topk_weights)
+        ) = self._preprocess_with_token_drop(topk_ids, topk_weights, step)
 
         self.num_out_tokens_before_drop = self.num_out_tokens
         self.num_out_tokens = self.num_out_tokens_after_drop
