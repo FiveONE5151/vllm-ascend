@@ -316,8 +316,6 @@ class AscendFusedMoE(FusedMoE):
         intermediate_size = kwargs["intermediate_size"]
         num_shared_experts = kwargs.get("n_shared_experts", 0)
 
-        logger.info(f"[yiwu][DEBUG] SP is {enable_sp()}")
-
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
