@@ -2116,6 +2116,7 @@ class NPUModelRunner(GPUModelRunner):
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        is_graph_warmup: bool = False,
     ) -> torch.Tensor:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode in {
@@ -2298,7 +2299,9 @@ class NPUModelRunner(GPUModelRunner):
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     model_instance=self.model,
-                    is_multimodal_model=self.is_multimodal_model):
+                    is_multimodal_model=self.is_multimodal_model,
+                    is_graph_warmup=is_graph_warmup,
+                    is_graph_capturing=is_graph_capturing,):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
                     intermediate_tensors, inputs_embeds)

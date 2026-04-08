@@ -689,7 +689,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             step: int) -> None:
         if self.ep_rank != 0:
             return
-        if get_forward_context().in_profile_run:
+        if get_forward_context().in_profile_run or get_forward_context().capturing or get_forward_context().is_graph_warmup:
             return
 
         expert_load_before = num_global_tokens_per_expert_before_drop.sum(
@@ -1434,8 +1434,12 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         """
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
-        self.token_drop_step += 1
-        step = self.token_drop_step
+        ctx = get_forward_context()
+
+        step = -1
+        if not (ctx.is_graph_warmup or ctx.capturing or ctx.in_profile_run):
+            self.token_drop_step += 1
+            step = self.token_drop_step
 
         assert self.hidden_shape is not None
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))

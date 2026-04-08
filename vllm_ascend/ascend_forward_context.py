@@ -38,7 +38,9 @@ def set_ascend_forward_context(
         batch_descriptor: Optional[BatchDescriptor] = None,
         model_instance: torch.nn.Module = None,
         is_draft_model=False,
-        is_multimodal_model=False):
+        is_multimodal_model=False,
+        is_graph_warmup=False,
+        is_graph_capturing=False,):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
@@ -68,6 +70,10 @@ def set_ascend_forward_context(
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
+
+        # [yiwu] NOTE: set my_capturing, dont intefere with capturing
+        forward_context.my_capturing = is_graph_capturing
+        forward_context.is_graph_warmup = is_graph_warmup
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
