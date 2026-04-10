@@ -143,6 +143,7 @@ class MoECommMethod(ABC):
         dispatch_results = self.token_dispatcher.token_dispatch(
             hidden_states=hidden_states,
             topk_weights=topk_weights,
+            router_logits=router_logits,
             topk_ids=topk_ids,
             expert_map=expert_map,
             global_redundant_expert_num=self.moe_config.
