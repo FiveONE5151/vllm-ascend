@@ -200,7 +200,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
@@ -316,7 +317,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
         self.original_shape = hidden_states.shape
 
@@ -435,7 +437,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
 
         """token dispatch for all2all
 
@@ -893,32 +896,89 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             local_topk_ids_after_drop: torch.Tensor,
             num_local_tokens_per_expert: torch.Tensor,
             device: torch.device) -> torch.Tensor:
-        flat_ids_before_drop = local_topk_ids_before_drop.reshape(-1).to(
-            torch.int64)
-        flat_ids_after_drop = local_topk_ids_after_drop.reshape(-1).to(
-            torch.int64)
-        kept_mask = flat_ids_after_drop < self.num_experts
+        topk = local_topk_ids_before_drop.shape[1]
+        num_local_tokens = local_topk_ids_before_drop.shape[0]
+        after_drop_cols = local_topk_ids_after_drop.shape[1]
+        is_expanded = after_drop_cols > topk
+        num_local_experts = after_drop_cols - topk if is_expanded else 0
 
+        # === Part 1: Handle original top-k positions ===
+        # Slice to first topk columns for comparison with before_drop
+        local_topk_ids_after_drop_original = local_topk_ids_after_drop[:, :topk]
+        flat_ids_before_drop = local_topk_ids_before_drop.reshape(-1).to(torch.int64)
+        flat_ids_after_drop = local_topk_ids_after_drop_original.reshape(-1).to(torch.int64)
+        kept_mask = flat_ids_after_drop < self.num_experts  # Sentinel num_experts = dropped
+
+        # Calculate starting positions for each expert in permuted tensor
         starts = torch.cumsum(num_local_tokens_per_expert.to(torch.int64), dim=0)
         starts = torch.cat(
             [torch.tensor([0], dtype=torch.int64, device=device), starts[:-1]])
 
         kept_indices: list[torch.Tensor] = []
-        for expert_idx in range(self.num_experts):
 
-            # [num_local_tokens*topk,], mask of tokens that are dispatched to current expert before drop
+        # For each expert, find which original positions are kept
+        for expert_idx in range(self.num_experts):
+            # [num_local_tokens*topk,], mask of tokens dispatched to current expert before drop
             expert_mask = (flat_ids_before_drop == expert_idx)
             keep_mask_expert = expert_mask & kept_mask
 
             # [num_local_tokens*topk,]
-            # 即当前expert被分配的token在后续permuted tokens中的位置
+            # occurrence rank of tokens assigned to current expert in permuted tensor
             expert_occurrence_rank = torch.cumsum(expert_mask.to(torch.int64),
                                                   dim=0) - 1
-            
+
             # [num_kept_tokens_this_expert,]
-            # 仅取出被保留的token在当前expert中的occurrence rank
+            # Get occurrence rank for kept tokens
             local_rank_in_expert = expert_occurrence_rank[keep_mask_expert]
             kept_indices.append(starts[expert_idx] + local_rank_in_expert)
+
+        # === Part 2: Handle expanded positions ===
+        # Expanded positions represent NEW routing to local experts for same tokens
+        # We need to find where these tokens appear in the original permuted tensor
+        if is_expanded and num_local_experts > 0:
+            # Expanded positions: [num_local_tokens, num_local_experts]
+            # Each position (i, j) corresponds to token i routed to local expert at column j
+            local_topk_ids_expanded = local_topk_ids_after_drop[:, topk:]
+            flat_ids_expanded = local_topk_ids_expanded.reshape(-1).to(torch.int64)
+
+            # Check which expanded positions are kept (expert_id < num_experts means kept)
+            expanded_kept_mask = flat_ids_expanded < self.num_experts
+
+            if expanded_kept_mask.any():
+                # Token indices for expanded positions: [num_local_tokens * num_local_experts]
+                expanded_token_indices = torch.arange(num_local_tokens, device=device)
+                expanded_token_indices = expanded_token_indices.unsqueeze(-1).expand(-1, num_local_experts)
+                flat_token_indices = expanded_token_indices.reshape(-1)
+
+                # Get kept expanded positions' token indices
+                kept_expanded_token_idx = flat_token_indices[expanded_kept_mask]
+
+                # For each kept expanded token, find its position in the original permuted tensor
+                # Strategy: use the first occurrence of each token based on its first original expert
+                # Build a mapping: token_idx -> position in permuted tensor (based on first expert)
+
+                # For each token, find its first position in permuted tensor
+                # Token's first original expert = local_topk_ids_before_drop[token_idx, 0]
+                first_original_expert = local_topk_ids_before_drop[:, 0].to(torch.int64)
+
+                # Calculate positions in permuted tensor for tokens based on their first expert
+                # The permuted tensor is organized by expert order
+                permuted_positions = torch.zeros(num_local_tokens, dtype=torch.int64, device=device)
+
+                # For each expert, calculate permuted positions for tokens whose first expert is this
+                for expert_idx in range(self.num_experts):
+                    # Find tokens whose first original expert is this expert
+                    tokens_for_expert_mask = (first_original_expert == expert_idx)
+                    num_tokens_for_expert = tokens_for_expert_mask.sum()
+                    if num_tokens_for_expert > 0:
+                        # These tokens appear at positions: start[expert_idx] + their occurrence rank
+                        ranks = torch.arange(num_tokens_for_expert.item(), device=device)
+                        token_indices_for_expert = tokens_for_expert_mask.nonzero().squeeze(-1)
+                        permuted_positions[token_indices_for_expert] = starts[expert_idx] + ranks
+
+                # Map expanded token indices to their permuted positions
+                expanded_permute_indices = permuted_positions[kept_expanded_token_idx]
+                kept_indices.append(expanded_permute_indices)
 
         if not kept_indices:
             return torch.empty(0, dtype=torch.int64, device=device)
@@ -1193,13 +1253,44 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         # [num_global_tokens, topk+num_local_experts]
         expanded_global_topk_weights = scores_buffer.gather(-1, expand_global_topk_ids)
 
+        # Deduplication: remove duplicates between original topk experts and expanded local experts
+        # For each token, if a local expert (in expanded part) is the same as an expert in original topk,
+        # mark the expanded position as duplicate (set weight=0, id=sentinel)
+        # This avoids duplicate computation and confusion in downstream steps
+
+        # Original topk expert ids: expand_global_topk_ids[:, :topk]
+        # Expanded local expert ids: expand_global_topk_ids[:, topk:]
+        topk = global_topk_ids.shape[1]
+        original_expert_ids = expand_global_topk_ids[:, :topk]  # [num_tokens, topk]
+        expanded_expert_ids = expand_global_topk_ids[:, topk:]  # [num_tokens, num_local_experts]
+
+        # Check for duplicates: for each expanded position, check if it matches any original expert
+        # Result: [num_tokens, num_local_experts] boolean mask where True means duplicate
+        duplicate_mask = (expanded_expert_ids.unsqueeze(-1) == original_expert_ids.unsqueeze(1)).any(dim=-1)
+
+        # Apply deduplication: mark duplicate expanded positions with sentinel
+        # expand_global_topk_ids will be masked with sentinel for duplicates later (after top_mask applied)
+        # We need to mark duplicate positions BEFORE applying top_mask
+
         # 把最终被选中且不超过容量限制的位置的权重保留，其他位置的权重设置为0
         # [T, topk+num_local_experts]
         expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(
             global_topk_weights.dtype)
 
+        # For duplicate expanded positions that were kept, set weight to 0 and id to sentinel
+        # Duplicate mask only applies to expanded part (columns after topk)
+        duplicate_kept_mask = duplicate_mask & top_mask[:, topk:]  # [num_tokens, num_local_experts]
+
+        # Set weights to 0 for duplicate kept positions
+        expanded_global_topk_weights[:, topk:] = expanded_global_topk_weights[:, topk:].masked_fill(
+            duplicate_kept_mask, 0.0)
+
         # 把最终被选中但超过容量限制的位置的expert index设置为num_experts (sentinel)，表示这些token将被丢弃
         expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
+
+        # Also set duplicate kept positions to sentinel (they will be treated as dropped)
+        expand_global_topk_ids[:, topk:] = expand_global_topk_ids[:, topk:].masked_fill(
+            duplicate_kept_mask, self.num_experts)
 
         return expanded_global_topk_weights, expand_global_topk_ids
 
@@ -1245,9 +1336,6 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         global_topk_weights = torch.zeros((num_tokens_across_dp.sum(), topk_weights.shape[1]),
                                          dtype=topk_weights.dtype,
                                          device=topk_weights.device)
-        global_router_logits = torch.zeros((num_tokens_across_dp.sum(), router_logits.shape[1]),
-                                         dtype=router_logits.dtype,
-                                         device=router_logits.device)
         # gather global topk_ids
         torch_npu.distributed.all_gather_into_tensor_uneven(
             global_topk_ids, topk_ids, num_tokens_across_dp.numpy(), group=self.ep_group
@@ -1255,16 +1343,25 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         torch_npu.distributed.all_gather_into_tensor_uneven(
             global_topk_weights, topk_weights, num_tokens_across_dp.numpy(), group=self.ep_group
         )
-        torch_npu.distributed.all_gather_into_tensor_uneven(
-            global_router_logits, router_logits, num_tokens_across_dp.numpy(), group=self.ep_group
-        )
+
+        # router_logits is only needed for expert_expanded_drop strategy
+        global_router_logits = None
+        if self.drop_strategy == "expert_expanded_drop":
+            if router_logits is None:
+                raise ValueError("router_logits is required for expert_expanded_drop strategy")
+            global_router_logits = torch.zeros((num_tokens_across_dp.sum(), router_logits.shape[1]),
+                                             dtype=router_logits.dtype,
+                                             device=router_logits.device)
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_router_logits, router_logits, num_tokens_across_dp.numpy(), group=self.ep_group
+            )
 
 
         if not torch.is_tensor(global_topk_ids):
             global_topk_ids = torch.cat([topk_ids] * ep_size, dim=0)
         if not torch.is_tensor(global_topk_weights):
             global_topk_weights = torch.cat([topk_weights] * ep_size, dim=0)
-        if not torch.is_tensor(global_router_logits):
+        if global_router_logits is not None and not torch.is_tensor(global_router_logits):
             global_router_logits = torch.cat([router_logits] * ep_size, dim=0)
 
 
