@@ -1673,6 +1673,102 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
             f"expanded_topk={self.expanded_topk} (original_topk={self.top_k}, num_local_experts={self.num_local_experts})"
         )
 
+    def _log_token_drop_statistics(
+                self,
+                num_global_tokens_per_expert_before_drop: torch.Tensor,
+                num_global_tokens_per_expert_after_drop: torch.Tensor,
+                expert_capacity: int,
+                device_capacity: int,
+                step: int) -> None:
+            if self.ep_rank != 0:
+                return
+            if get_forward_context().in_profile_run or get_forward_context().capturing or get_forward_context().is_graph_warmup:
+                return
+
+            expert_load_before = num_global_tokens_per_expert_before_drop.sum(
+                dim=0).to(torch.int64)
+            expert_load_after = num_global_tokens_per_expert_after_drop.sum(
+                dim=0).to(torch.int64)
+
+            rank_load_before = num_global_tokens_per_expert_before_drop.reshape(
+                self.ep_size, self.ep_size, self.num_local_experts).sum(
+                    dim=(0, 2)).to(torch.int64)
+            rank_load_after = num_global_tokens_per_expert_after_drop.reshape(
+                self.ep_size, self.ep_size, self.num_local_experts).sum(
+                    dim=(0, 2)).to(torch.int64)
+
+            max_expert_before, max_expert_before_idx = torch.max(expert_load_before,
+                                                                dim=0)
+            max_expert_after, max_expert_after_idx = torch.max(expert_load_after,
+                                                                dim=0)
+            max_rank_before, max_rank_before_idx = torch.max(rank_load_before,
+                                                            dim=0)
+            max_rank_after, max_rank_after_idx = torch.max(rank_load_after, dim=0)
+
+            logger.info(
+                "[TokenDrop][step=%d] Max expert load before=%d (expert=%d), after=%d (expert=%d), expert_capacity=%d",
+                step,
+                int(max_expert_before.item()),
+                int(max_expert_before_idx.item()),
+                int(max_expert_after.item()),
+                int(max_expert_after_idx.item()),
+                int(expert_capacity),
+            )
+            logger.info(
+                "[TokenDrop][step=%d] Max rank load before=%d (rank=%d), after=%d (rank=%d), device_capacity=%d",
+                step,
+                int(max_rank_before.item()),
+                int(max_rank_before_idx.item()),
+                int(max_rank_after.item()),
+                int(max_rank_after_idx.item()),
+                int(device_capacity),
+            )
+
+            if not self.token_drop_csv_dir:
+                logger.warning(
+                    "[TokenDrop][step=%d] CSV not written because VLLM_TOKEN_DROP_CSV_DIR is not set.",
+                    step)
+                return
+
+            try:
+                os.makedirs(self.token_drop_csv_dir, exist_ok=True)
+                csv_path = os.path.join(
+                    self.token_drop_csv_dir,
+                    "token_drop_stats_rank0.csv")
+                should_write_header = (not os.path.exists(csv_path)
+                                    or os.path.getsize(csv_path) == 0)
+
+                with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if should_write_header:
+                        writer.writerow([
+                            "step",
+                            "expert_id",
+                            "before_tokens",
+                            "after_tokens",
+                            "dropped_tokens",
+                            "capacity",
+                        ])
+
+                    for expert_idx in range(self.num_experts):
+                        before_val = int(expert_load_before[expert_idx].item())
+                        after_val = int(expert_load_after[expert_idx].item())
+                        writer.writerow([
+                            step,
+                            expert_idx,
+                            before_val,
+                            after_val,
+                            before_val - after_val,
+                            int(expert_capacity),
+                        ])
+
+                logger.info("[TokenDrop][step=%d] CSV saved to: %s", step,
+                            csv_path)
+            except Exception as e:
+                logger.warning("[TokenDrop][step=%d] Failed to write CSV: %s",
+                            step, str(e))
+
+
     def _rank_token_ranges(self, num_tokens_across_dp: torch.Tensor) -> list[tuple[int, int]]:
         """Compute token ranges for each rank in the global tensor."""
         token_prefix = torch.cumsum(num_tokens_across_dp.to(torch.int64), dim=0)
@@ -1728,27 +1824,13 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         # Concatenate to get expanded candidate set [T, topk + num_local_experts]
         expand_global_topk_ids = torch.cat([global_topk_ids, local_expert_indices_t], dim=-1)
 
-        # Step 2: Deduplication - detect duplicates between expanded and original experts
-        original_expert_ids = expand_global_topk_ids[:, :topk]      # [T, topk]
-        expanded_expert_ids = expand_global_topk_ids[:, topk:]      # [T, num_local_experts]
-
-        # Check if each expanded expert matches any original expert
-        # [T, num_local_experts, topk] -> .any(dim=-1) -> [T, num_local_experts]
-        duplicate_mask = (expanded_expert_ids.unsqueeze(-1) == original_expert_ids.unsqueeze(1)).any(dim=-1)
-
         # Step 3: Prepare buffers for scatter operations
         mask_buffer = torch.zeros((T, self.num_experts), dtype=torch.bool, device=device)
         scores_buffer = torch.zeros((T, self.num_experts), dtype=global_router_logits.dtype, device=device)
 
-        # Pre-mark duplicate positions as invalid to avoid scatter conflicts
-        expand_global_topk_ids_for_scatter = expand_global_topk_ids.clone()
-        expand_global_topk_ids_for_scatter[:, topk:] = expand_global_topk_ids_for_scatter[:, topk:].masked_fill(
-            duplicate_mask, self.num_experts  # Use sentinel for duplicate positions
-        )
-
         # Scatter mark valid positions and scores
-        mask_buffer.scatter_(-1, expand_global_topk_ids_for_scatter, True)
-        scores_buffer.scatter_(-1, expand_global_topk_ids_for_scatter, global_router_logits)
+        mask_buffer.scatter_(-1, expand_global_topk_ids, True)
+        scores_buffer.scatter_(-1, expand_global_topk_ids, global_router_logits)
 
         # Step 4: Capacity-based top-k per expert
         capacity = min(expert_capacity, scores_buffer.shape[0])
@@ -1762,15 +1844,14 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         top_mask = kept_mask.gather(-1, expand_global_topk_ids)
         expanded_global_topk_weights = scores_buffer.gather(-1, expand_global_topk_ids)
 
+        # deduplicaate
+        for pos in range(topk, self.expanded_topk):
+            duplicate_mask = (expand_global_topk_ids[:, pos:pos+1] == expand_global_topk_ids[:, :pos]).any(dim=-1)
+            top_mask[duplicate_mask, pos] = False  # Mark duplicates as False in the keep mask
+
         # Apply mask to weights and ids
         expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(global_topk_weights.dtype)
         expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
-
-        # Step 6: Force mark duplicate positions as sentinel (even if selected by capacity)
-        expanded_global_topk_weights[:, topk:] = expanded_global_topk_weights[:, topk:].masked_fill(
-            duplicate_mask, 0.0)
-        expand_global_topk_ids[:, topk:] = expand_global_topk_ids[:, topk:].masked_fill(
-            duplicate_mask, self.num_experts)
 
         return expanded_global_topk_weights, expand_global_topk_ids
 
@@ -1929,6 +2010,15 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         T_local = topk_ids.shape[0]
         num_out_tokens_before_drop = T_local * self.expanded_topk
         num_out_tokens_after_drop = int(input_splits.sum().item())
+
+        if self.token_drop_logging:
+            self._log_token_drop_statistics(
+                num_global_tokens_per_expert_before_drop=num_global_tokens_per_expert_before_drop,
+                num_global_tokens_per_expert_after_drop=num_global_tokens_per_expert_after_drop,
+                expert_capacity=expert_capacity,
+                device_capacity=expert_capacity * self.num_local_experts,
+                step=step,
+            )
 
         return (
             num_tokens_per_local_expert,
