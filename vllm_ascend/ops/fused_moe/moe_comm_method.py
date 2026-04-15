@@ -37,6 +37,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher, TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAll2AllvTokenDrop,
+    TokenDispatcherWithAll2AllvExpandedDrop,
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
 from vllm.logger import logger
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
@@ -254,13 +255,22 @@ class AlltoAllCommImpl(MoECommMethod):
 
     def _get_token_dispatcher(self):
         if envs_ascend.VLLM_ENABLE_TOKEN_DROP:
-            logger.info(f"[YIWU] [token drop] Using TokenDispatcherWithAll2AllvTokenDrop with load factor {envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR}")
-            return TokenDispatcherWithAll2AllvTokenDrop(
-                top_k=self.moe_config.experts_per_token,
-                num_experts=self.moe_config.num_experts,
-                num_local_experts=self.moe_config.num_local_experts,
-                token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR,
-                token_drop_local_only=envs_ascend.VLLM_TOKEN_DROP_LOCAL_ONLY)
+            token_drop_strategy = os.getenv("VLLM_TOKEN_DROP_STRATEGY", "expert_drop")
+            if token_drop_strategy == "expert_expanded_drop":
+                logger.info(f"[ExpandedDrop] Using TokenDispatcherWithAll2AllvExpandedDrop with load factor {envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR}")
+                return TokenDispatcherWithAll2AllvExpandedDrop(
+                    top_k=self.moe_config.experts_per_token,
+                    num_experts=self.moe_config.num_experts,
+                    num_local_experts=self.moe_config.num_local_experts,
+                    token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR)
+            else:
+                logger.info(f"[TokenDrop] Using TokenDispatcherWithAll2AllvTokenDrop with load factor {envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR}, strategy={token_drop_strategy}")
+                return TokenDispatcherWithAll2AllvTokenDrop(
+                    top_k=self.moe_config.experts_per_token,
+                    num_experts=self.moe_config.num_experts,
+                    num_local_experts=self.moe_config.num_local_experts,
+                    token_drop_load_factor=envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR,
+                    token_drop_local_only=envs_ascend.VLLM_TOKEN_DROP_LOCAL_ONLY)
         return TokenDispatcherWithAll2AllV(
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,

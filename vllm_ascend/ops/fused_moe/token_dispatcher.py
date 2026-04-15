@@ -200,7 +200,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
@@ -1506,6 +1507,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
                 output_splits：本 rank 在 all2all 中从各对端 rank 接收的 token 数（recv split）。
                 topk_weights：router 给每个 token 的 top-k 权重，combine 时用于加权还原。
                 reversed_local_input_permutation_mapping：第一次本地 npu_moe_token_permute 的逆映射（最终恢复原 token 顺序用）。
+                    每个token复制topk个，根据token序列排序；第i个元素表示按照token序列的第i个token在第一次本地permute (专家序列)后的序列中的位置；
                 reversed_global_input_permutation_mapping：第二次“按本地 expert 分组”重排的逆映射；仅 num_local_experts > 1 时有值，否则为 None。
         """
         self.with_quant = with_quant
@@ -1636,4 +1638,524 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         output = self._combine_postprocess(restored_local_tokens,
                                            context_metadata)
 
+        return TokenCombineResult(routed_out=output)
+
+
+class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
+    """
+    Token dispatcher that implements expanded drop strategy.
+
+    Expanded drop strategy:
+    - Extends each token's candidate expert set by adding all local experts of the rank where the token resides
+    - Performs capacity-based token drop on the expanded candidate set
+    - Goal: allow local experts to process more tokens, improving local compute efficiency and reducing cross-rank communication
+
+    Key differences from standard token drop:
+    - topk_ids shape: [T, topk + num_local_experts] instead of [T, topk]
+    - Duplicate handling: expanded local experts may overlap with original top-k experts
+    - Permute strategy: unified permute + truncate valid tokens (sentinel tokens are placed at the end)
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Expanded drop specific parameters
+        self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
+        self.expanded_topk = self.top_k + self.num_local_experts  # expanded candidate count
+
+        # Logging and statistics configuration
+        self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
+        self.token_drop_csv_dir = os.getenv("VLLM_TOKEN_DROP_CSV_DIR", "")
+        self.token_drop_step = 0
+
+        logger.info(
+            f"[ExpandedDrop] Initialized TokenDispatcherWithAll2AllvExpandedDrop with "
+            f"token_drop_load_factor={self.token_drop_load_factor}, "
+            f"expanded_topk={self.expanded_topk} (original_topk={self.top_k}, num_local_experts={self.num_local_experts})"
+        )
+
+    def _rank_token_ranges(self, num_tokens_across_dp: torch.Tensor) -> list[tuple[int, int]]:
+        """Compute token ranges for each rank in the global tensor."""
+        token_prefix = torch.cumsum(num_tokens_across_dp.to(torch.int64), dim=0)
+        token_starts = token_prefix - num_tokens_across_dp.to(torch.int64)
+        token_ranges: list[tuple[int, int]] = []
+        for rank in range(self.ep_size):
+            start = int(token_starts[rank].item())
+            end = int(token_prefix[rank].item())
+            token_ranges.append((start, end))
+        return token_ranges
+
+    def _get_topk_ids_weights_after_expanded_drop_by_expert(
+            self,
+            global_topk_ids: torch.Tensor,          # [T, topk]
+            global_topk_weights: torch.Tensor,      # [T, topk]
+            global_router_logits: torch.Tensor,     # [T, num_experts]
+            expert_capacity: int,
+            num_tokens_across_dp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Implement expanded drop strategy with deduplication.
+
+        Steps:
+        1. Construct expanded candidate expert set [T, topk + num_local_experts]
+        2. Deduplicate: detect overlap between expanded local experts and original top-k experts
+        3. Scatter to mask/scores buffer and perform capacity-based top-k per expert
+        4. Gather back to expanded candidate view
+        5. Force mark duplicate positions as sentinel
+
+        Returns:
+            expanded_global_topk_weights: [T, topk + num_local_experts]
+            expand_global_topk_ids: [T, topk + num_local_experts] (deduplicated)
+        """
+        T = global_topk_ids.shape[0]
+        topk = global_topk_ids.shape[1]
+        device = global_topk_ids.device
+
+        # Step 1: Construct expanded local expert indices for each token
+        token_ranges = self._rank_token_ranges(num_tokens_across_dp)
+        rank_ids = torch.zeros(T, dtype=torch.int64, device=device)
+        for rank, (start, end) in enumerate(token_ranges):
+            rank_ids[start:end] = rank
+
+        # Each token's local experts start index in global expert space
+        rank_experts_start_idx = rank_ids * self.num_local_experts
+
+        # Generate all local expert indices [num_local_experts]
+        all_local_expert_ids = torch.arange(self.num_local_experts, device=device)
+
+        # Broadcast to [T, num_local_experts]
+        local_expert_indices_t = rank_experts_start_idx.unsqueeze(-1) + all_local_expert_ids.unsqueeze(0)
+
+        # Concatenate to get expanded candidate set [T, topk + num_local_experts]
+        expand_global_topk_ids = torch.cat([global_topk_ids, local_expert_indices_t], dim=-1)
+
+        # Step 2: Deduplication - detect duplicates between expanded and original experts
+        original_expert_ids = expand_global_topk_ids[:, :topk]      # [T, topk]
+        expanded_expert_ids = expand_global_topk_ids[:, topk:]      # [T, num_local_experts]
+
+        # Check if each expanded expert matches any original expert
+        # [T, num_local_experts, topk] -> .any(dim=-1) -> [T, num_local_experts]
+        duplicate_mask = (expanded_expert_ids.unsqueeze(-1) == original_expert_ids.unsqueeze(1)).any(dim=-1)
+
+        # Step 3: Prepare buffers for scatter operations
+        mask_buffer = torch.zeros((T, self.num_experts), dtype=torch.bool, device=device)
+        scores_buffer = torch.zeros((T, self.num_experts), dtype=global_router_logits.dtype, device=device)
+
+        # Pre-mark duplicate positions as invalid to avoid scatter conflicts
+        expand_global_topk_ids_for_scatter = expand_global_topk_ids.clone()
+        expand_global_topk_ids_for_scatter[:, topk:] = expand_global_topk_ids_for_scatter[:, topk:].masked_fill(
+            duplicate_mask, self.num_experts  # Use sentinel for duplicate positions
+        )
+
+        # Scatter mark valid positions and scores
+        mask_buffer.scatter_(-1, expand_global_topk_ids_for_scatter, True)
+        scores_buffer.scatter_(-1, expand_global_topk_ids_for_scatter, global_router_logits)
+
+        # Step 4: Capacity-based top-k per expert
+        capacity = min(expert_capacity, scores_buffer.shape[0])
+        masked_scores = scores_buffer.masked_fill(~mask_buffer, float('-inf'))
+        _, capacity_indices = torch.topk(masked_scores, k=capacity, dim=0, sorted=False)
+
+        # Construct kept mask: positions that are both in candidates and within capacity
+        kept_mask = torch.zeros_like(mask_buffer).scatter(0, capacity_indices, True) & mask_buffer
+
+        # Step 5: Gather back to expanded candidate view
+        top_mask = kept_mask.gather(-1, expand_global_topk_ids)
+        expanded_global_topk_weights = scores_buffer.gather(-1, expand_global_topk_ids)
+
+        # Apply mask to weights and ids
+        expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(global_topk_weights.dtype)
+        expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
+
+        # Step 6: Force mark duplicate positions as sentinel (even if selected by capacity)
+        expanded_global_topk_weights[:, topk:] = expanded_global_topk_weights[:, topk:].masked_fill(
+            duplicate_mask, 0.0)
+        expand_global_topk_ids[:, topk:] = expand_global_topk_ids[:, topk:].masked_fill(
+            duplicate_mask, self.num_experts)
+
+        return expanded_global_topk_weights, expand_global_topk_ids
+
+    def _compute_num_global_tokens_per_expert_after_drop(
+            self,
+            global_topk_ids_after_drop: torch.Tensor,  # [T, expanded_topk]
+            num_tokens_across_dp: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute token count per global expert after expanded drop.
+
+        Returns:
+            num_global_tokens_per_expert_after_drop: [ep_size, num_experts]
+        """
+        num_global_tokens_per_expert_after_drop = torch.zeros(
+            (self.ep_size, self.num_experts),
+            dtype=torch.int64,
+            device=global_topk_ids_after_drop.device,
+        )
+
+        token_ranges = self._rank_token_ranges(num_tokens_across_dp)
+        for rank, (start, end) in enumerate(token_ranges):
+            current_topk_ids = global_topk_ids_after_drop[start:end, :]
+
+            # Flatten and filter sentinel values
+            flat_expert_ids = current_topk_ids.reshape(-1).to(torch.int64)
+            valid_mask = (flat_expert_ids < self.num_experts).to(torch.int64)
+            safe_expert_ids = torch.clamp(flat_expert_ids, min=0, max=self.num_experts - 1)
+
+            per_rank_counts = torch.zeros(
+                self.num_experts,
+                dtype=torch.int64,
+                device=global_topk_ids_after_drop.device,
+            )
+            per_rank_counts.scatter_add_(0, safe_expert_ids, valid_mask)
+            num_global_tokens_per_expert_after_drop[rank] = per_rank_counts
+
+        return num_global_tokens_per_expert_after_drop
+
+    def _preprocess_with_expanded_drop(
+            self,
+            topk_ids: torch.Tensor,                     # [T_local, topk]
+            topk_weights: torch.Tensor,                 # [T_local, topk]
+            router_logits: torch.Tensor,                # [T_local, num_experts]
+            step: int = 0,
+    ):
+        """
+        Preprocess for expanded drop strategy.
+
+        Returns:
+            num_tokens_per_local_expert: [num_local_experts]
+            input_splits: numpy array [ep_size]
+            output_splits: numpy array [ep_size]
+            num_global_tokens_per_local_expert: [ep_size, num_local_experts]
+            global_input_tokens_local_experts_indices: [num_received_tokens] or None
+            num_out_tokens_before_drop: T_local * expanded_topk
+            num_out_tokens_after_drop: actual kept token count
+            topk_ids_after_drop: [T_local, expanded_topk]
+            topk_weights_after_drop: [T_local, expanded_topk]
+            expert_capacity: int
+            num_global_tokens_per_expert_before_drop: [ep_size, num_experts]
+        """
+        device = topk_ids.device
+
+        # Step 1: Statistics before drop (based on original topk_ids)
+        num_local_tokens_per_expert = torch.histc(
+            topk_ids, bins=self.num_experts, min=0, max=self.num_experts
+        ).to(torch.int64)
+
+        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+            num_local_tokens_per_expert, group=self.ep_group
+        ).reshape(self.ep_size, self.num_experts).to(torch.int64)
+
+        # Step 2: Get global token distribution
+        num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+
+        # Step 3: Global gather - shape adaptation for expanded_topk
+        # Note: router_logits shape is [T, num_experts], no expansion needed
+        T_global = int(num_tokens_across_dp.sum().item())
+
+        global_router_logits = torch.zeros(
+            (T_global, self.num_experts), dtype=router_logits.dtype, device=device
+        )
+
+        # Gather across EP ranks
+        # Note: We only gather the original topk portion; expanded portion will be filled locally
+        # Ensure tensors are contiguous for all_gather_into_tensor_uneven
+        # Create contiguous output tensors for all_gather, then copy to global tensors
+        global_topk_ids = torch.zeros(
+            (T_global, self.top_k), dtype=topk_ids.dtype, device=device
+        )
+        global_topk_weights = torch.zeros(
+            (T_global, self.top_k), dtype=topk_weights.dtype, device=device
+        )
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            global_topk_ids, topk_ids, num_tokens_across_dp.numpy(), group=self.ep_group
+        )
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            global_topk_weights, topk_weights, num_tokens_across_dp.numpy(), group=self.ep_group
+        )
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            global_router_logits, router_logits, num_tokens_across_dp.numpy(), group=self.ep_group
+        )
+
+        # Step 4: Calculate expert capacity
+        expert_capacity = math.ceil(
+            T_global * self.top_k * self.token_drop_load_factor / self.num_experts
+        )
+
+        # Step 5: Execute expanded drop (with deduplication)
+        global_topk_weights_after_drop, global_topk_ids_after_drop = \
+            self._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,  # Only original topk for initial ids
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Step 6: Compute after_drop statistics
+        num_global_tokens_per_expert_after_drop = self._compute_num_global_tokens_per_expert_after_drop(
+            global_topk_ids_after_drop, num_tokens_across_dp
+        )
+
+        # Step 7: Calculate splits
+        # Extract local expert columns
+        local_expert_start = self.local_expert_indices[0]
+        local_expert_end = self.local_expert_indices[-1] + 1
+        num_global_tokens_per_local_expert = num_global_tokens_per_expert_after_drop[:, local_expert_start:local_expert_end]
+
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+
+        output_splits = num_global_tokens_per_local_expert.sum(dim=-1).to(
+            torch.device("cpu"), non_blocking=True
+        )
+
+        input_splits = num_global_tokens_per_expert_after_drop[self.ep_rank].reshape(
+            self.ep_size, self.num_local_experts
+        ).sum(dim=1).to(torch.device("cpu"), non_blocking=True)
+
+        # Step 8: Compute global_input_tokens_local_experts_indices
+        global_input_tokens_local_experts_indices = None
+        if self.num_local_experts > 1:
+            global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.ravel()
+            )
+
+        # Step 9: Extract current rank's after_drop results
+        token_ranges = self._rank_token_ranges(num_tokens_across_dp)
+        this_rank_start, this_rank_end = token_ranges[self.ep_rank]
+        topk_ids_after_drop = global_topk_ids_after_drop[this_rank_start:this_rank_end, :]
+        topk_weights_after_drop = global_topk_weights_after_drop[this_rank_start:this_rank_end, :]
+
+        # Step 10: Calculate num_out_tokens
+        T_local = topk_ids.shape[0]
+        num_out_tokens_before_drop = T_local * self.expanded_topk
+        num_out_tokens_after_drop = int(input_splits.sum().item())
+
+        return (
+            num_tokens_per_local_expert,
+            input_splits.numpy(),
+            output_splits.numpy(),
+            num_global_tokens_per_local_expert,
+            global_input_tokens_local_experts_indices,
+            num_out_tokens_before_drop,
+            num_out_tokens_after_drop,
+            topk_ids_after_drop,
+            topk_weights_after_drop,
+            expert_capacity,
+            num_global_tokens_per_expert_before_drop,
+        )
+
+    def token_dispatch(
+            self,
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            expert_map: Optional[torch.Tensor] = None,
+            global_redundant_expert_num: int = 0,
+            mc2_mask: Optional[torch.Tensor] = None,
+            apply_router_weight_on_input: bool = False,
+            with_quant: bool = False,
+            dynamic_eplb: bool = False,
+            pertoken_scale: Optional[torch.Tensor] = None,
+            router_logits: Optional[torch.Tensor] = None,
+    ):
+        """
+        Token dispatch for expanded drop strategy.
+
+        Key steps:
+        1. Preprocess with expanded drop to get topk_ids_after_drop [T, expanded_topk]
+        2. Permute with expanded topk_ids (sentinel tokens placed at end)
+        3. Truncate to keep only valid tokens (num_out_tokens_after_drop)
+        4. All2all communication
+        5. Postprocess for local expert grouping
+
+        Returns:
+            TokenDispatchResult with context_metadata for combine
+        """
+        self.with_quant = with_quant
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        self.hidden_shape_before_permute = hidden_states.shape
+
+        # Track step for logging
+        ctx = get_forward_context()
+        step = -1
+        if not (ctx.is_graph_warmup or ctx.capturing or ctx.in_profile_run):
+            self.token_drop_step += 1
+            step = self.token_drop_step
+
+        # Step 1: Preprocess with expanded drop
+        (num_tokens_per_local_expert,
+         input_splits,
+         output_splits,
+         num_global_tokens_per_local_expert,
+         global_input_tokens_local_experts_indices,
+         num_out_tokens_before_drop,
+         num_out_tokens_after_drop,
+         topk_ids_after_drop,
+         topk_weights_after_drop,
+         expert_capacity,
+         num_global_tokens_per_expert_before_drop,
+        ) = self._preprocess_with_expanded_drop(topk_ids, topk_weights, router_logits, step)
+
+        self.num_out_tokens_before_drop = num_out_tokens_before_drop
+        self.num_out_tokens = num_out_tokens_after_drop
+
+        # Step 2: Permute - directly pass expanded topk_ids
+        # npu_moe_token_permute expands all token-expert pairs
+        # Note: Sentinel pairs are NOT at the end - they are intermixed
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = \
+            torch_npu.npu_moe_token_permute(
+                tokens=hidden_states,
+                indices=topk_ids_after_drop,
+                num_out_tokens=num_out_tokens_before_drop,
+            )
+
+        # Step 3: Compute valid permuted positions and use index_select
+        # reversed_mapping[i] gives the original index (token * expanded_topk + pos)
+        # We need to identify which permuted positions correspond to valid (non-sentinel) pairs
+
+        # Create valid mask for permuted positions
+        # For each position in reversed_mapping, check if the corresponding original pair is valid
+        # Flatten topk_ids_after_drop to check validity
+        flat_topk_ids = topk_ids_after_drop.reshape(-1)  # [T * expanded_topk]
+        valid_original_mask = (flat_topk_ids < self.num_experts)  # True for valid original indices
+
+        # Save the FULL reversed_mapping before index_select for use in combine
+        full_reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping.clone()
+
+        # Use reversed_mapping to get validity for each permuted position
+        # reversed_mapping gives original indices, so we can check validity
+        original_indices = reversed_local_input_permutation_mapping.to(torch.int64)
+        permuted_valid_mask = valid_original_mask[original_indices]  # True for valid permuted positions
+
+        # Get indices of valid permuted positions
+        valid_permuted_indices = permuted_valid_mask.nonzero(as_tuple=True)[0]
+
+        # Use index_select to keep only valid positions
+        permutated_local_input_tokens = permutated_local_input_tokens.index_select(
+            0, valid_permuted_indices
+        )
+        reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping.index_select(
+            0, valid_permuted_indices
+        )
+
+        # Step 4: All2all communication
+        dynamic_scale_after_all2all = None
+        if self.with_quant:
+            permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
+                permutated_local_input_tokens
+            )
+            _, dynamic_scale_after_all2all, quant_all2all_handle = async_all_to_all(
+                dynamic_scale, output_splits, input_splits, self.ep_group
+            )
+            quant_all2all_handle.wait()
+            dynamic_scale.untyped_storage().resize_(0)
+
+        _, global_input_tokens, all2all_handle = async_all_to_all(
+            permutated_local_input_tokens, output_splits, input_splits, self.ep_group
+        )
+        all2all_handle.wait()
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
+        # Step 5: Postprocess - local expert grouping
+        global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = \
+            self._dispatch_postprocess(
+                global_input_tokens,
+                dynamic_scale_after_all2all,
+                global_input_tokens_local_experts_indices,
+            )
+
+        # Step 6: Build context_metadata
+        context_metadata = {
+            "input_splits": input_splits,
+            "output_splits": output_splits,
+            "topk_weights": topk_weights,  # Original topk_weights for reference
+            "expanded_topk_weights": topk_weights_after_drop,  # Expanded weights for combine
+            "reversed_local_input_permutation_mapping": reversed_local_input_permutation_mapping,  # Selected version
+            "full_reversed_local_input_permutation_mapping": full_reversed_local_input_permutation_mapping,  # Full version for unpermute
+            "reversed_global_input_permutation_mapping": reversed_global_input_permutation_mapping,
+            "num_out_tokens_before_drop": num_out_tokens_before_drop,
+            "num_out_tokens_after_drop": num_out_tokens_after_drop,
+            "original_topk": self.top_k,
+            "expanded_topk": self.expanded_topk,
+            "valid_permuted_indices": valid_permuted_indices,  # For combine to reconstruct
+            "expert_capacity": expert_capacity,
+            "num_global_tokens_per_expert_before_drop": num_global_tokens_per_expert_before_drop,
+            "num_global_tokens_per_local_expert_after_drop": num_global_tokens_per_local_expert,
+        }
+
+        return TokenDispatchResult(
+            hidden_states=global_input_tokens,
+            dynamic_scale=dynamic_scale_final,
+            group_list=num_tokens_per_local_expert,
+            group_list_type=1,
+            context_metadata=context_metadata,
+        )
+
+    @override
+    def token_combine(
+            self,
+            hidden_states: torch.Tensor,
+            context_metadata: dict,
+            bias: Optional[torch.Tensor] = None,
+    ):
+        """
+        Token combine for expanded drop strategy.
+
+        Key steps:
+        1. Preprocess - undo local expert grouping
+        2. All2all - send tokens back to source ranks
+        3. Reconstruct - place tokens back to valid permuted positions
+        4. Create full tensor - for unpermute operation
+        5. Unpermute - restore original token order with expanded weights
+
+        Returns:
+            TokenCombineResult with restored hidden states
+        """
+        assert bias is None, "Bias is not supported in expanded drop dispatcher."
+
+        # Step 1: Preprocess - undo local expert grouping
+        # unpermute to ep rank sequence, use the mapping of expanded permute
+        hidden_states = self._combine_preprocess(hidden_states, context_metadata)
+
+        # Step 2: All2all - send tokens back to source ranks
+        _, permutated_local_input_tokens, all2all_handle = async_all_to_all(
+            hidden_states,
+            context_metadata["input_splits"],
+            context_metadata["output_splits"],
+            self.ep_group,
+        )
+        all2all_handle.wait()
+        hidden_states.untyped_storage().resize_(0)
+
+        # Step 3: Reconstruct full permuted tensor
+        # We need to place tokens back to their original permuted positions
+        num_out_tokens_before_drop = context_metadata["num_out_tokens_before_drop"]
+
+        restored_local_tokens = torch.zeros(
+            (num_out_tokens_before_drop, permutated_local_input_tokens.shape[-1]),
+            dtype=permutated_local_input_tokens.dtype,
+            device=permutated_local_input_tokens.device,
+        )
+
+        # Place tokens at valid_permuted_indices positions
+        valid_permuted_indices = context_metadata["valid_permuted_indices"]
+        restored_local_tokens.index_copy_(0, valid_permuted_indices, permutated_local_input_tokens)
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
+        # Step 4: Unpermute - restore original token order
+        # Use the FULL reversed_mapping saved during dispatch
+        full_reversed_mapping = context_metadata["full_reversed_local_input_permutation_mapping"]
+
+        # Use expanded topk_weights for weighted aggregation
+        expanded_topk_weights = context_metadata["expanded_topk_weights"]
+
+        output = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=restored_local_tokens,
+            sorted_indices=full_reversed_mapping.to(torch.int32),
+            probs=expanded_topk_weights,
+            restore_shape=self.hidden_shape_before_permute,
+        )
+
+        output = output.view(self.hidden_shape)
         return TokenCombineResult(routed_out=output)
