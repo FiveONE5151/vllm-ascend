@@ -25,6 +25,7 @@ import csv
 from dataclasses import dataclass, field
 import math
 from typing import Optional
+from sympy import O
 import torch_npu.distributed
 from typing_extensions import override
 
@@ -317,7 +318,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
         self.original_shape = hidden_states.shape
 
@@ -436,7 +438,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
-                       pertoken_scale: Optional[torch.Tensor] = None):
+                       pertoken_scale: Optional[torch.Tensor] = None,
+                       router_logits: Optional[torch.Tensor] = None):
 
         """token dispatch for all2all
 
@@ -900,7 +903,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             torch.int64)
         kept_mask = flat_ids_after_drop < self.num_experts
 
+        # [num_experts]
         starts = torch.cumsum(num_local_tokens_per_expert.to(torch.int64), dim=0)
+
+        # [num_experts]
+        # the offset of each expert in the local permuted token sequence
         starts = torch.cat(
             [torch.tensor([0], dtype=torch.int64, device=device), starts[:-1]])
 
@@ -912,7 +919,7 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             keep_mask_expert = expert_mask & kept_mask
 
             # [num_local_tokens*topk,]
-            # 即当前expert被分配的token在后续permuted tokens中的位置
+            # 即当前expert被分配的token在后续permuted tokens中该专家buffer内的偏移量
             expert_occurrence_rank = torch.cumsum(expert_mask.to(torch.int64),
                                                   dim=0) - 1
             
@@ -1329,16 +1336,10 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         this_rank_start, this_rank_end = rank_token_ranges[self.ep_rank]
         this_rank_topk_ids_after_drop = global_topk_ids_after_drop[this_rank_start:this_rank_end,
                                                                     :]
+        this_rank_topk_weights_after_drop = global_topk_weights_after_drop[this_rank_start:this_rank_end,
+                                                                    :]
 
         self.num_out_tokens_after_drop = int(input_splits.sum().item())
-
-        # get local permute keep indices for token drop, shape: [num_local_tokens_kept]
-        local_permute_keep_indices = self._get_local_permute_keep_indices_from_topk(
-            topk_ids,
-            this_rank_topk_ids_after_drop,
-            num_local_tokens_per_expert,
-            topk_ids.device,
-        )
 
         if self.token_drop_logging:
             self._log_token_drop_statistics(
@@ -1357,10 +1358,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             output_splits.numpy(),
             num_global_tokens_per_local_expert,
             global_input_tokens_local_experts_indices,
-            local_permute_keep_indices,
             expert_capacity,
             global_avg_tokens_per_expert,
             num_global_tokens_per_expert,
+            this_rank_topk_ids_after_drop,
+            this_rank_topk_weights_after_drop,
         )
 
     def _preprocess_with_token_drop_local(
@@ -1529,10 +1531,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             output_splits,
             num_global_tokens_per_local_expert,
             global_input_tokens_local_experts_indices,
-            local_permute_keep_indices,
             expert_capacity,
             global_avg_tokens_per_expert,
             num_global_tokens_per_expert_before_drop,
+            topk_ids_after_drop,
+            topk_weights_after_drop
         ) = self._preprocess_with_token_drop(topk_ids, topk_weights, router_logits, step)
 
         self.num_out_tokens_before_drop = self.num_out_tokens
@@ -1540,14 +1543,12 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
         permutated_local_input_tokens, reversed_local_input_permutation_mapping = torch_npu.npu_moe_token_permute(
             tokens=hidden_states,
-            indices=topk_ids,
+            indices=topk_ids_after_drop,
             num_out_tokens=self.num_out_tokens_before_drop,
         )
 
-
         # select kept tokens after drop in the local permuted token sequence
-        permutated_local_input_tokens = permutated_local_input_tokens.index_select(
-            0, local_permute_keep_indices)
+        permutated_local_input_tokens = permutated_local_input_tokens[:self.num_out_tokens]
 
         dynamic_scale_after_all2all = None
         if self.with_quant:
@@ -1582,8 +1583,6 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             reversed_local_input_permutation_mapping,
             "reversed_global_input_permutation_mapping":
             reversed_global_input_permutation_mapping,
-            "local_permute_keep_indices":
-            local_permute_keep_indices,
             "num_out_tokens_before_drop":
             self.num_out_tokens_before_drop,
             "expert_capacity":
@@ -1594,6 +1593,10 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             num_global_tokens_per_expert_before_drop,
             "num_global_tokens_per_local_expert_after_drop":
             num_global_tokens_per_local_expert,
+            "topk_ids_after_drop":
+            topk_ids_after_drop,
+            "topk_weights_after_drop":
+            topk_weights_after_drop,
         }
 
         return TokenDispatchResult(
@@ -1628,15 +1631,19 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             dtype=permutated_local_input_tokens.dtype,
             device=permutated_local_input_tokens.device,
         )
-        restored_local_tokens.index_copy_(0,
-                                          context_metadata[
-                                              "local_permute_keep_indices"],
-                                          permutated_local_input_tokens)
+        restored_local_tokens[:self.num_out_tokens] = permutated_local_input_tokens
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # 3. Postprocess using metadata
-        output = self._combine_postprocess(restored_local_tokens,
-                                           context_metadata)
+        # Unpermutation 1: AlltoAll output to output
+        output = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=restored_local_tokens,
+            sorted_indices=context_metadata[
+                "reversed_local_input_permutation_mapping"].to(torch.int32),
+            probs=context_metadata["topk_weights_after_drop"],
+            restore_shape=self.hidden_shape_before_permute,
+        )
+        output = output.view(self.hidden_shape)
 
         return TokenCombineResult(routed_out=output)
 
@@ -1872,9 +1879,15 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
             topk_weights_from_probs.dtype)
         expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
 
-        # renormalize
-        expanded_global_topk_weights = expanded_global_topk_weights / expanded_global_topk_weights.sum(dim=-1, keepdim=True)
-
+        # Safe renormalize: avoid NaN when a token has all-zero kept weights.
+        row_sum = expanded_global_topk_weights.sum(dim=-1, keepdim=True)
+        eps = torch.finfo(expanded_global_topk_weights.dtype).eps
+        nonzero_mask = row_sum > eps
+        expanded_global_topk_weights = torch.where(
+            nonzero_mask,
+            expanded_global_topk_weights / row_sum.clamp_min(eps),
+            torch.zeros_like(expanded_global_topk_weights),
+        )
         return expanded_global_topk_weights, expand_global_topk_ids
 
     def _compute_num_global_tokens_per_expert_after_drop(
@@ -2123,34 +2136,15 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
                 num_out_tokens=num_out_tokens_before_drop,
             )
 
-        # Step 3: Compute valid permuted positions and use index_select
-        # reversed_mapping[i] gives the original index (token * expanded_topk + pos)
-        # We need to identify which permuted positions correspond to valid (non-sentinel) pairs
+        # Step 3: Compute valid permuted positions
+        # permutated tokens are expert major, so droppedd pairs (with sentinel num_experts) will be grouped together at the end of permutated buffer
+        permutated_local_input_tokens = permutated_local_input_tokens[:self.num_out_tokens]
 
-        # Create valid mask for permuted positions
-        # For each position in reversed_mapping, check if the corresponding original pair is valid
-        # Flatten topk_ids_after_drop to check validity
-        flat_topk_ids = topk_ids_after_drop.reshape(-1)  # [T * expanded_topk]
-        valid_original_mask = (flat_topk_ids < self.num_experts)  # True for valid original indices
-
-        # Save the FULL reversed_mapping before index_select for use in combine
-        full_reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping.clone()
-
-        # Use reversed_mapping to get validity for each permuted position
-        # reversed_mapping gives original indices, so we can check validity
-        temp_flat_topk_ids = flat_topk_ids.to(dtype=torch.float32)
-        permuted_valid_mask = valid_original_mask[torch.argsort(temp_flat_topk_ids, stable=True)]
-
-        # Get indices of valid permuted positions
-        valid_permuted_indices = permuted_valid_mask.nonzero(as_tuple=True)[0]
-
-        # Use index_select to keep only valid positions
-        permutated_local_input_tokens = permutated_local_input_tokens.index_select(
-            0, valid_permuted_indices
-        )
-        reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping.index_select(
-            0, valid_permuted_indices
-        )
+        # dont have to do the selection since we will append to expanded version before drop, then do the combine with the full reversed mapping.
+        # reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping.index_select(
+        #     0, valid_permuted_indices
+        # )
+        full_reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping
 
         # Step 4: All2all communication
         dynamic_scale_after_all2all = None
@@ -2184,14 +2178,12 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
             "output_splits": output_splits,
             "topk_weights": topk_weights,  # Original topk_weights for reference
             "expanded_topk_weights": topk_weights_after_drop,  # Expanded weights for combine
-            "reversed_local_input_permutation_mapping": reversed_local_input_permutation_mapping,  # Selected version
             "full_reversed_local_input_permutation_mapping": full_reversed_local_input_permutation_mapping,  # Full version for unpermute
             "reversed_global_input_permutation_mapping": reversed_global_input_permutation_mapping,
             "num_out_tokens_before_drop": num_out_tokens_before_drop,
             "num_out_tokens_after_drop": num_out_tokens_after_drop,
             "original_topk": self.top_k,
             "expanded_topk": self.expanded_topk,
-            "valid_permuted_indices": valid_permuted_indices,  # For combine to reconstruct
             "expert_capacity": expert_capacity,
             "num_global_tokens_per_expert_before_drop": num_global_tokens_per_expert_before_drop,
             "num_global_tokens_per_local_expert_after_drop": num_global_tokens_per_local_expert,
@@ -2251,9 +2243,8 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
             device=permutated_local_input_tokens.device,
         )
 
-        # Place tokens at valid_permuted_indices positions
-        valid_permuted_indices = context_metadata["valid_permuted_indices"]
-        restored_local_tokens.index_copy_(0, valid_permuted_indices, permutated_local_input_tokens)
+        # restore tokens to expanded permuted positions before drop
+        restored_local_tokens[:self.num_out_tokens] = permutated_local_input_tokens
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Step 4: Unpermute - restore original token order
