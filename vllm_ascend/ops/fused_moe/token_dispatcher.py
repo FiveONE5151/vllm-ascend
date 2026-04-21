@@ -404,7 +404,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         if self.num_local_experts > 1:
             self.expert_ids_per_ep_rank = torch.tensor(
                 [i % self.num_local_experts for i in range(self.num_experts)],
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=torch.npu.current_device(),
             )
 
@@ -1806,6 +1806,16 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         topk = global_topk_ids.shape[1]
         device = global_topk_ids.device
 
+        # Use the same routing semantics as native expert selection:
+        # softmax on router logits, then top-k.
+        router_probs = torch.softmax(global_router_logits, dim=-1)
+        topk_weights_from_probs, topk_ids_from_probs = torch.topk(
+            router_probs.to(torch.float32),
+            k=topk,
+            dim=-1,
+        )
+        topk_ids_from_probs = topk_ids_from_probs.to(global_topk_ids.dtype)
+
         # Step 1: Construct expanded local expert indices for each token
         token_ranges = self._rank_token_ranges(num_tokens_across_dp)
         rank_ids = torch.zeros(T, dtype=torch.int64, device=device)
@@ -1822,36 +1832,48 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         local_expert_indices_t = rank_experts_start_idx.unsqueeze(-1) + all_local_expert_ids.unsqueeze(0)
 
         # Concatenate to get expanded candidate set [T, topk + num_local_experts]
-        expand_global_topk_ids = torch.cat([global_topk_ids, local_expert_indices_t], dim=-1)
+        expand_global_topk_ids = torch.cat([topk_ids_from_probs, local_expert_indices_t], dim=-1)
 
-        # Step 3: Prepare buffers for scatter operations
-        mask_buffer = torch.zeros((T, self.num_experts), dtype=torch.bool, device=device)
-        scores_buffer = torch.zeros((T, self.num_experts), dtype=global_router_logits.dtype, device=device)
+        # Build masks from softmax-topk pairs and expanded local candidates.
+        topk_mask_buffer = torch.zeros((T, self.num_experts),
+                           dtype=torch.bool,
+                           device=device)
+        topk_mask_buffer.scatter_(-1, topk_ids_from_probs, True)
 
-        # Scatter mark valid positions and scores
-        mask_buffer.scatter_(-1, expand_global_topk_ids, True)
-        scores_buffer.scatter_(-1, expand_global_topk_ids, global_router_logits)
+        local_mask_buffer = torch.zeros((T, self.num_experts),
+                        dtype=torch.bool,
+                        device=device)
+        local_mask_buffer.scatter_(-1, local_expert_indices_t, True)
+
+        expanded_mask_buffer = topk_mask_buffer | local_mask_buffer
 
         # Step 4: Capacity-based top-k per expert
-        capacity = min(expert_capacity, scores_buffer.shape[0])
-        masked_scores = scores_buffer.masked_fill(~mask_buffer, float('-inf'))
-        _, capacity_indices = torch.topk(masked_scores, k=capacity, dim=0, sorted=False)
+        capacity = min(expert_capacity, router_probs.shape[0])
+        masked_scores = router_probs.masked_fill(~expanded_mask_buffer,
+                             float('-inf'))
+        _, capacity_indices = torch.topk(masked_scores, k=capacity, dim=0, sorted=True)
 
         # Construct kept mask: positions that are both in candidates and within capacity
-        kept_mask = torch.zeros_like(mask_buffer).scatter(0, capacity_indices, True) & mask_buffer
+        kept_mask = torch.zeros_like(expanded_mask_buffer).scatter(
+            0, capacity_indices, True) & expanded_mask_buffer
 
         # Step 5: Gather back to expanded candidate view
         top_mask = kept_mask.gather(-1, expand_global_topk_ids)
-        expanded_global_topk_weights = scores_buffer.gather(-1, expand_global_topk_ids)
+        expanded_global_topk_weights = router_probs.gather(-1,
+                                   expand_global_topk_ids)
 
         # deduplicaate
         for pos in range(topk, self.expanded_topk):
             duplicate_mask = (expand_global_topk_ids[:, pos:pos+1] == expand_global_topk_ids[:, :pos]).any(dim=-1)
-            top_mask[duplicate_mask, pos] = False  # Mark duplicates as False in the keep mask
+            top_mask[:, pos] = top_mask[:, pos] & ~duplicate_mask
 
         # Apply mask to weights and ids
-        expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(global_topk_weights.dtype)
+        expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(
+            topk_weights_from_probs.dtype)
         expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
+
+        # renormalize
+        expanded_global_topk_weights = expanded_global_topk_weights / expanded_global_topk_weights.sum(dim=-1, keepdim=True)
 
         return expanded_global_topk_weights, expand_global_topk_ids
 
@@ -1997,8 +2019,9 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         if self.num_local_experts > 1:
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 self.expert_ids_per_ep_rank,
-                num_global_tokens_per_local_expert.ravel()
+                num_global_tokens_per_local_expert.flatten()
             )
+
 
         # Step 9: Extract current rank's after_drop results
         token_ranges = self._rank_token_ranges(num_tokens_across_dp)
@@ -2115,8 +2138,8 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
 
         # Use reversed_mapping to get validity for each permuted position
         # reversed_mapping gives original indices, so we can check validity
-        original_indices = reversed_local_input_permutation_mapping.to(torch.int64)
-        permuted_valid_mask = valid_original_mask[original_indices]  # True for valid permuted positions
+        temp_flat_topk_ids = flat_topk_ids.to(dtype=torch.float32)
+        permuted_valid_mask = valid_original_mask[torch.argsort(temp_flat_topk_ids, stable=True)]
 
         # Get indices of valid permuted positions
         valid_permuted_indices = permuted_valid_mask.nonzero(as_tuple=True)[0]

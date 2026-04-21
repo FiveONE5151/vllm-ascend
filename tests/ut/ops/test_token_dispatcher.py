@@ -24,8 +24,8 @@ from tests.ut.base import TestBase
 
 from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     AscendDeviceType, TokenDispatcherWithAll2AllV,
-    TokenDispatcherWithAll2AllvTokenDrop, TokenDispatcherWithAllGather,
-    TokenDispatcherWithMC2)
+    TokenDispatcherWithAll2AllvTokenDrop, TokenDispatcherWithAll2AllvExpandedDrop,
+    TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
 
 
 class TestTokenDispatcherWithMC2(TestBase):
@@ -1011,3 +1011,626 @@ class TestTokenDispatcherWithAll2AllvTokenDrop(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+class TestTokenDispatcherWithAll2AllvExpandedDrop(TestBase):
+    """
+    Unit tests for Expanded Drop strategy.
+
+    Expanded Drop strategy:
+    - Extends each token's candidate expert set by adding all local experts of the rank where the token resides
+    - Performs capacity-based token drop on the expanded candidate set
+    - Deduplicates when local experts overlap with top-k experts
+    """
+
+    def setUp(self):
+        # Patch properties
+        patcher1 = patch.object(TokenDispatcherWithAll2AllvExpandedDrop,
+                                'ep_group',
+                                new_callable=PropertyMock,
+                                return_value=MagicMock())
+        patcher2 = patch.object(TokenDispatcherWithAll2AllvExpandedDrop,
+                                'ep_rank',
+                                new_callable=PropertyMock,
+                                return_value=0)
+        patcher3 = patch.object(TokenDispatcherWithAll2AllvExpandedDrop,
+                                'ep_size',
+                                new_callable=PropertyMock,
+                                return_value=4)
+
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
+        self.addCleanup(patcher3.stop)
+
+        patcher1.start()
+        patcher2.start()
+        patcher3.start()
+
+        # Common test parameters
+        self.num_experts = 16
+        self.num_local_experts = 4
+        self.top_k = 2
+        self.token_drop_load_factor = 1.2
+        self.expanded_topk = self.top_k + self.num_local_experts
+
+        # Create dispatcher with patches
+        with patch('torch.npu.current_device', return_value='cpu'), \
+             patch('torch.distributed.get_rank', return_value=0):
+            self.dispatcher = TokenDispatcherWithAll2AllvExpandedDrop(
+                top_k=self.top_k,
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                token_drop_load_factor=self.token_drop_load_factor,
+            )
+
+        # Set additional attributes
+        self.dispatcher.expert_ids_per_ep_rank = torch.tensor(
+            [i % self.num_local_experts for i in range(self.num_experts)],
+            dtype=torch.int32
+        )
+        self.dispatcher.local_expert_indices = list(
+            range(0, self.num_local_experts)  # Rank 0's local experts
+        )
+
+    # ========================================
+    # Test 1: Expanded Candidate Set Construction
+    # ========================================
+
+    def test_expanded_candidate_set_shape(self):
+        """Test that expanded candidate set has correct shape."""
+        num_tokens = 16
+        topk = self.top_k
+
+        global_topk_ids = torch.randint(
+            0, self.num_experts, (num_tokens, topk), dtype=torch.int64
+        )
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        # Single rank scenario
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 10
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        expected_shape = (num_tokens, self.expanded_topk)
+        assert expanded_ids.shape == expected_shape, \
+            f"Expected shape {expected_shape}, got {expanded_ids.shape}"
+        assert expanded_weights.shape == expected_shape
+
+    def test_expanded_candidate_set_local_expert_indices(self):
+        """
+        Test that each token's local experts are correctly expanded.
+
+        For rank 0 tokens, local experts should be [0, 1, 2, 3].
+        For rank 1 tokens, local experts should be [4, 5, 6, 7].
+        """
+        num_tokens_per_rank = 8
+        T_global = num_tokens_per_rank * 4  # 4 ranks
+        topk = self.top_k
+
+        # Create global topk_ids
+        global_topk_ids = torch.zeros((T_global, topk), dtype=torch.int64)
+        global_topk_ids[:, 0] = torch.arange(T_global) % self.num_experts
+        global_topk_ids[:, 1] = (torch.arange(T_global) + 1) % self.num_experts
+
+        global_topk_weights = torch.rand((T_global, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (T_global, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor(
+            [num_tokens_per_rank] * 4, dtype=torch.int64
+        )
+        expert_capacity = 10
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Verify local expert indices for each rank
+        token_ranges = self.dispatcher._rank_token_ranges(num_tokens_across_dp)
+
+        for rank, (start, end) in enumerate(token_ranges):
+            local_expert_start = rank * self.num_local_experts
+            expected_local_experts = list(range(
+                local_expert_start,
+                local_expert_start + self.num_local_experts
+            ))
+
+            # Check expanded portion (columns topk:)
+            for token_idx in range(start, end):
+                actual_local_experts = expanded_ids[token_idx, topk:].tolist()
+                # Filter out sentinel values
+                actual_local_experts = [
+                    e for e in actual_local_experts if e != self.num_experts
+                ]
+
+                for expert in actual_local_experts:
+                    assert expert in expected_local_experts, \
+                        f"Token {token_idx} on rank {rank}: " \
+                        f"expert {expert} not in expected {expected_local_experts}"
+
+    # ========================================
+    # Test 2: Deduplication Logic
+    # ========================================
+
+    def test_deduplication_local_expert_overlaps_with_topk(self):
+        """
+        Test that when a local expert is already in top-k,
+        the expanded position is marked as sentinel.
+        """
+        num_tokens = 4
+        topk = self.top_k
+
+        # Token 0: top-k = [0, 5], local experts [0,1,2,3]
+        # Expert 0 appears in both top-k and local experts -> should be deduplicated
+        global_topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        global_topk_ids[0, 0] = 0  # Expert 0 (local to rank 0)
+        global_topk_ids[0, 1] = 5  # Expert 5 (remote)
+        global_topk_ids[1:, 0] = 5
+        global_topk_ids[1:, 1] = 6
+
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 10
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Token 0's expanded position 0 (expert 0) should be sentinel
+        token0_expanded_local = expanded_ids[0, topk:].tolist()
+
+        # Position 0 in expanded portion corresponds to local expert 0
+        # It should be marked as sentinel because it duplicates with top-k[0]
+        assert token0_expanded_local[0] == self.num_experts, \
+            f"Expected duplicated expert 0 to be sentinel, got {token0_expanded_local[0]}"
+        assert expanded_weights[0, topk] == 0.0, \
+            "Duplicated position should have weight 0"
+
+    def test_deduplication_preserves_original_topk(self):
+        """
+        Verify that deduplication does not affect original top-k experts.
+
+        When expert 0 is in both top-k and local experts:
+        - Original top-k position should remain valid
+        - Only expanded position should be marked as sentinel
+        """
+        num_tokens = 4
+        topk = self.top_k
+
+        global_topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        global_topk_ids[0, 0] = 0  # Expert 0 is in top-k
+
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+        # Give expert 0 high score
+        global_router_logits[0, 0] = 10.0
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 10
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Original top-k position should still have expert 0
+        assert expanded_ids[0, 0] == 0, \
+            f"Original top-k should be preserved, got {expanded_ids[0, 0]}"
+        assert expanded_weights[0, 0] > 0, \
+            "Original top-k weight should be preserved"
+
+    # ========================================
+    # Test 3: Capacity-Based Token Drop
+    # ========================================
+
+    def test_capacity_drop_keeps_highest_scores(self):
+        """
+        Test that when expert is overloaded, tokens with highest scores are kept.
+        """
+        num_tokens = 20
+        topk = self.top_k
+        expert_capacity = 5
+
+        # All tokens select expert 0
+        global_topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+
+        # Create router logits where expert 0 has increasing scores
+        global_router_logits = torch.zeros(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+        for i in range(num_tokens):
+            global_router_logits[i, 0] = i * 1.0  # Unique, increasing scores
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Count valid tokens for expert 0
+        valid_mask = expanded_ids < self.num_experts
+        expert_0_mask = (expanded_ids == 0) & valid_mask
+        count_expert_0 = expert_0_mask.sum().item()
+
+        assert count_expert_0 <= expert_capacity, \
+            f"Expert 0 should have at most {expert_capacity} tokens, got {count_expert_0}"
+
+    def test_capacity_drop_per_expert_limit(self):
+        """Verify that each expert has at most `capacity` tokens after drop."""
+        num_tokens = 32
+        topk = self.top_k
+
+        global_topk_ids = torch.randint(
+            0, self.num_experts, (num_tokens, topk), dtype=torch.int64
+        )
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 8
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Count valid tokens per expert
+        valid_mask = expanded_ids < self.num_experts
+
+        for expert_id in range(self.num_experts):
+            expert_mask = (expanded_ids == expert_id) & valid_mask
+            count = expert_mask.sum().item()
+
+            assert count <= expert_capacity, \
+                f"Expert {expert_id} has {count} tokens, exceeds capacity {expert_capacity}"
+
+    # ========================================
+    # Test 4: Statistics Computation
+    # ========================================
+
+    def test_compute_num_global_tokens_per_expert_after_drop(self):
+        """Test num_global_tokens_per_expert_after_drop computation."""
+        num_tokens_per_rank = 8
+        T_global = num_tokens_per_rank * 4
+        expanded_topk = self.expanded_topk
+
+        # Create after_drop ids with known distribution
+        global_topk_ids_after_drop = torch.full(
+            (T_global, expanded_topk), self.num_experts, dtype=torch.int64
+        )
+
+        # Rank 0 tokens: assign to experts 0, 1
+        global_topk_ids_after_drop[:num_tokens_per_rank, 0] = 0
+        global_topk_ids_after_drop[:num_tokens_per_rank, 1] = 1
+
+        # Rank 1 tokens: assign to experts 4, 5
+        global_topk_ids_after_drop[
+            num_tokens_per_rank:2*num_tokens_per_rank, 0
+        ] = 4
+        global_topk_ids_after_drop[
+            num_tokens_per_rank:2*num_tokens_per_rank, 1
+        ] = 5
+
+        num_tokens_across_dp = torch.tensor(
+            [num_tokens_per_rank] * 4, dtype=torch.int64
+        )
+
+        result = self.dispatcher._compute_num_global_tokens_per_expert_after_drop(
+            global_topk_ids_after_drop, num_tokens_across_dp
+        )
+
+        # Verify shape
+        assert result.shape == (4, self.num_experts), \
+            f"Expected shape (4, {self.num_experts}), got {result.shape}"
+
+        # Verify counts
+        assert result[0, 0] == num_tokens_per_rank, \
+            f"Rank 0 should have {num_tokens_per_rank} tokens for expert 0"
+        assert result[0, 1] == num_tokens_per_rank, \
+            f"Rank 0 should have {num_tokens_per_rank} tokens for expert 1"
+
+    def test_rank_token_ranges(self):
+        """Test _rank_token_ranges correctly computes token ranges for each rank."""
+        num_tokens_across_dp = torch.tensor([8, 12, 6, 10], dtype=torch.int64)
+
+        token_ranges = self.dispatcher._rank_token_ranges(num_tokens_across_dp)
+
+        assert len(token_ranges) == 4
+        assert token_ranges[0] == (0, 8)
+        assert token_ranges[1] == (8, 20)
+        assert token_ranges[2] == (20, 26)
+        assert token_ranges[3] == (26, 36)
+
+    # ========================================
+    # Test 5: Edge Cases
+    # ========================================
+
+    def test_empty_token_input(self):
+        """Test behavior with zero tokens."""
+        global_topk_ids = torch.zeros((0, self.top_k), dtype=torch.int64)
+        global_topk_weights = torch.zeros((0, self.top_k), dtype=torch.float32)
+        global_router_logits = torch.zeros(
+            (0, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([0] * 4, dtype=torch.int64)
+        expert_capacity = 5
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        assert expanded_ids.shape == (0, self.expanded_topk)
+        assert expanded_weights.shape == (0, self.expanded_topk)
+
+    def test_capacity_zero_drops_all_tokens(self):
+        """When capacity = 0, all tokens should be dropped."""
+        num_tokens = 10
+
+        global_topk_ids = torch.randint(
+            0, self.num_experts, (num_tokens, self.top_k), dtype=torch.int64
+        )
+        global_topk_weights = torch.rand(
+            (num_tokens, self.top_k), dtype=torch.float32
+        )
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 0
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # All positions should be sentinel
+        assert torch.all(expanded_ids == self.num_experts), \
+            "All tokens should be dropped when capacity=0"
+        assert torch.all(expanded_weights == 0), \
+            "All weights should be 0 when capacity=0"
+
+    def test_large_capacity_no_drop(self):
+        """When capacity is large enough, no tokens should be dropped."""
+        num_tokens = 10
+
+        global_topk_ids = torch.randint(
+            0, self.num_experts, (num_tokens, self.top_k), dtype=torch.int64
+        )
+        global_topk_weights = torch.rand(
+            (num_tokens, self.top_k), dtype=torch.float32
+        )
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = num_tokens * self.top_k * 2  # Large capacity
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Original top-k positions should all be valid
+        assert torch.all(expanded_ids[:, :self.top_k] == global_topk_ids), \
+            "Original top-k should be preserved when no drop"
+
+    def test_capacity_one_keeps_only_highest_score(self):
+        """Test that capacity=1 keeps only the highest-scoring token."""
+        # Use single expert scenario
+        dispatcher = TokenDispatcherWithAll2AllvExpandedDrop.__new__(
+            TokenDispatcherWithAll2AllvExpandedDrop
+        )
+        dispatcher.num_experts = 4
+        dispatcher.num_local_experts = 4
+        dispatcher.top_k = 1
+        dispatcher.expanded_topk = 1 + 4
+        dispatcher.local_expert_indices = [0, 1, 2, 3]
+
+        num_tokens = 10
+        topk = 1
+
+        global_topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int64)
+        global_topk_weights = torch.ones((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.zeros((num_tokens, 4), dtype=torch.float32)
+
+        # Token 7 has the highest score for expert 0
+        global_router_logits[7, 0] = 100.0
+        for i in range(num_tokens):
+            if i != 7:
+                global_router_logits[i, 0] = float(i)
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 1
+
+        expanded_weights, expanded_ids = \
+            dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Only one token should be kept for expert 0
+        valid_mask = expanded_ids < 4
+        expert_0_mask = (expanded_ids == 0) & valid_mask
+
+        assert expert_0_mask.sum().item() == 1, \
+            "Only one token should be kept for expert 0"
+
+    # ========================================
+    # Test 6: Integration-style Tests
+    # ========================================
+
+    def test_full_expanded_drop_invariants(self):
+        """
+        Test invariants for the expanded drop workflow.
+
+        Invariants:
+        1. Sum of input_splits equals num_out_tokens_after_drop
+        2. expanded_topk = topk + num_local_experts
+        3. All valid tokens have non-zero weights
+        """
+        num_tokens = 16
+        topk = self.top_k
+
+        global_topk_ids = torch.randint(
+            0, self.num_experts, (num_tokens, topk), dtype=torch.int64
+        )
+        global_topk_weights = torch.rand((num_tokens, topk), dtype=torch.float32)
+        global_router_logits = torch.rand(
+            (num_tokens, self.num_experts), dtype=torch.float32
+        )
+
+        num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+        expert_capacity = 10
+
+        expanded_weights, expanded_ids = \
+            self.dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                global_topk_ids,
+                global_topk_weights,
+                global_router_logits,
+                expert_capacity,
+                num_tokens_across_dp,
+            )
+
+        # Invariant 1: expanded_topk = topk + num_local_experts
+        assert expanded_ids.shape[1] == self.expanded_topk
+
+        # Invariant 2: Valid tokens have non-zero weights
+        valid_mask = expanded_ids < self.num_experts
+        valid_weights = expanded_weights[valid_mask]
+        assert torch.all(valid_weights != 0), \
+            "Valid tokens should have non-zero weights"
+
+        # Invariant 3: Dropped tokens have zero weights
+        dropped_mask = expanded_ids == self.num_experts
+        dropped_weights = expanded_weights[dropped_mask]
+        assert torch.all(dropped_weights == 0), \
+            "Dropped tokens should have zero weights"
+
+    def test_expanded_drop_with_various_configs(self):
+        """Test expanded drop with various configurations."""
+        configs = [
+            # (num_experts, num_local_experts, topk, num_tokens, capacity)
+            (8, 2, 2, 16, 8),
+            (16, 4, 2, 32, 10),
+            (32, 4, 4, 64, 20),
+            (64, 8, 4, 128, 30),
+        ]
+
+        for num_experts, num_local_experts, topk, num_tokens, capacity in configs:
+            # Create temporary dispatcher
+            with patch.object(
+                TokenDispatcherWithAll2AllvExpandedDrop,
+                'ep_group', new_callable=PropertyMock, return_value=MagicMock()
+            ), \
+            patch.object(
+                TokenDispatcherWithAll2AllvExpandedDrop,
+                'ep_rank', new_callable=PropertyMock, return_value=0
+            ), \
+            patch.object(
+                TokenDispatcherWithAll2AllvExpandedDrop,
+                'ep_size', new_callable=PropertyMock, return_value=1
+            ):
+                dispatcher = TokenDispatcherWithAll2AllvExpandedDrop(
+                    top_k=topk,
+                    num_experts=num_experts,
+                    num_local_experts=num_local_experts,
+                    token_drop_load_factor=1.2,
+                )
+                dispatcher.local_expert_indices = list(range(num_local_experts))
+
+                global_topk_ids = torch.randint(
+                    0, num_experts, (num_tokens, topk), dtype=torch.int64
+                )
+                global_topk_weights = torch.rand(
+                    (num_tokens, topk), dtype=torch.float32
+                )
+                global_router_logits = torch.rand(
+                    (num_tokens, num_experts), dtype=torch.float32
+                )
+
+                num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int64)
+
+                expanded_weights, expanded_ids = \
+                    dispatcher._get_topk_ids_weights_after_expanded_drop_by_expert(
+                        global_topk_ids,
+                        global_topk_weights,
+                        global_router_logits,
+                        capacity,
+                        num_tokens_across_dp,
+                    )
+
+                # Verify shape
+                expected_expanded_topk = topk + num_local_experts
+                assert expanded_ids.shape == (num_tokens, expected_expanded_topk)
+
+                # Verify capacity constraint
+                valid_mask = expanded_ids < num_experts
+                for expert_id in range(num_experts):
+                    expert_mask = (expanded_ids == expert_id) & valid_mask
+                    count = expert_mask.sum().item()
+                    assert count <= capacity, \
+                        f"Config ({num_experts}, {num_local_experts}, {topk}): " \
+                        f"Expert {expert_id} exceeds capacity {capacity}"
