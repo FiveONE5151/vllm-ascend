@@ -668,6 +668,262 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         return output
 
 
+class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
+    """
+    Unified dispatcher that handles both regular and token drop cases.
+
+    This dispatcher ONLY handles communication (permute + all2all + unpermute).
+    Token drop logic is applied in experts_selector via TokenDropStrategy,
+    so the dispatcher receives pre-processed topk_ids and topk_weights.
+
+    Key features:
+    - Handles both [T, topk] (non-expanded) and [T, topk+N] (expanded) shapes
+    - Dropped tokens have expert index set to num_experts (sentinel)
+    - Computes splits based on valid tokens (non-sentinel)
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.is_expanded = kwargs.get("is_expanded", False)
+        self.expanded_topk = (self.top_k + self.num_local_experts
+                              if self.is_expanded else self.top_k)
+        self.num_out_tokens_before_drop = None
+
+        logger.info(
+            f"[UnifiedDispatcher] Initialized with is_expanded={self.is_expanded}, "
+            f"top_k={self.top_k}, expanded_topk={self.expanded_topk}, "
+            f"num_local_experts={self.num_local_experts}"
+        )
+
+    def token_dispatch(
+            self,
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            expert_map: Optional[torch.Tensor] = None,
+            global_redundant_expert_num: int = 0,
+            mc2_mask: Optional[torch.Tensor] = None,
+            apply_router_weight_on_input: bool = False,
+            with_quant: bool = False,
+            dynamic_eplb: bool = False,
+            pertoken_scale: Optional[torch.Tensor] = None,
+            router_logits: Optional[torch.Tensor] = None):
+        """
+        Token dispatch for unified dispatcher.
+
+        topk_ids already processed by experts_selector (with token drop applied if enabled).
+        - Non-expanded: [T, topk] shape
+        - Expanded: [T, topk + num_local_experts] shape
+        Dropped tokens have expert index set to num_experts (sentinel).
+
+        Pipeline:
+        1. Compute splits from topk_ids (already dropped)
+        2. Permute (all token-expert pairs including sentinels)
+        3. Truncate kept tokens (sentinel tokens grouped at end in permuted buffer)
+        4. All2all
+        5. Postprocess (local expert grouping)
+        """
+        self.with_quant = with_quant
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        self.hidden_shape_before_permute = hidden_states.shape
+
+        # Compute preprocessing based on pre-dropped topk_ids
+        (tokens_per_expert,
+         input_splits,
+         output_splits,
+         num_global_tokens_per_local_expert,
+         global_input_tokens_local_experts_indices,
+         num_out_tokens_before_drop,
+         num_out_tokens_after_drop) = self._preprocess_with_dropped_topk(topk_ids)
+
+        self.num_out_tokens_before_drop = num_out_tokens_before_drop
+        self.num_out_tokens = num_out_tokens_after_drop
+
+        # Permute - includes all token-expert pairs (sentinel pairs grouped at end)
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = \
+            torch_npu.npu_moe_token_permute(
+                tokens=hidden_states,
+                indices=topk_ids,
+                num_out_tokens=num_out_tokens_before_drop,
+            )
+
+        # Truncate to kept tokens (sentinel pairs are at the end of permuted buffer)
+        permutated_local_input_tokens = permutated_local_input_tokens[:self.num_out_tokens]
+
+        # Store full reversed mapping for combine
+        full_reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping
+
+        dynamic_scale_after_all2all = None
+        if self.with_quant:
+            permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
+                permutated_local_input_tokens)
+            _, dynamic_scale_after_all2all, quant_all2all_handle = async_all_to_all(
+                dynamic_scale, output_splits, input_splits, self.ep_group)
+            quant_all2all_handle.wait()
+            dynamic_scale.untyped_storage().resize_(0)
+
+        # All2all communication
+        _, global_input_tokens, all2all_handle = async_all_to_all(
+            permutated_local_input_tokens, output_splits, input_splits, self.ep_group)
+        all2all_handle.wait()
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
+        # Postprocess - local expert grouping
+        global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = \
+            self._dispatch_postprocess(
+                global_input_tokens,
+                dynamic_scale_after_all2all,
+                global_input_tokens_local_experts_indices,
+            )
+
+        # Build context metadata
+        context_metadata = {
+            "input_splits": input_splits,
+            "output_splits": output_splits,
+            "topk_weights": topk_weights,
+            "full_reversed_local_input_permutation_mapping": full_reversed_local_input_permutation_mapping,
+            "reversed_global_input_permutation_mapping": reversed_global_input_permutation_mapping,
+            "num_out_tokens_before_drop": num_out_tokens_before_drop,
+            "num_out_tokens_after_drop": num_out_tokens_after_drop,
+        }
+
+        return TokenDispatchResult(
+            hidden_states=global_input_tokens,
+            dynamic_scale=dynamic_scale_final,
+            group_list=tokens_per_expert,
+            group_list_type=1,
+            context_metadata=context_metadata,
+        )
+
+    def _preprocess_with_dropped_topk(self, topk_ids: torch.Tensor):
+        """
+        Preprocess with already-dropped topk_ids.
+
+        topk_ids may contain sentinel values (num_experts) for dropped tokens.
+        Compute splits based on valid (non-sentinel) tokens.
+
+        Returns:
+            num_tokens_per_local_expert: [num_local_experts]
+            input_splits: numpy array [ep_size]
+            output_splits: numpy array [ep_size]
+            num_global_tokens_per_local_expert: [ep_size, num_local_experts]
+            global_input_tokens_local_experts_indices: [num_received_tokens] or None
+            num_out_tokens_before_drop: T_local * expanded_topk (or topk)
+            num_out_tokens_after_drop: actual kept token count
+        """
+        device = topk_ids.device
+        T_local = topk_ids.shape[0]
+        actual_topk = topk_ids.shape[1]  # Could be topk or topk + num_local_experts
+
+        # Count valid tokens (non-sentinel)
+        valid_mask = topk_ids < self.num_experts
+
+        # Local tokens per expert (only valid ones)
+        valid_topk_ids = topk_ids.masked_fill(~valid_mask, 0)
+        num_local_tokens_per_expert_all = torch.histc(
+            valid_topk_ids.view(-1),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts - 1
+        ).to(torch.int64)
+
+        # Adjust counts: subtract invalid sentinel placeholders
+        num_sentinel_per_expert = torch.zeros(
+            self.num_experts, dtype=torch.int64, device=device)
+        # Sentinel tokens are marked as num_experts, which we need to exclude
+        # Since we used min=0, max=num_experts-1 in histc, sentinels aren't counted
+        # But we need to count how many sentinel tokens exist
+        num_local_tokens_per_expert = num_local_tokens_per_expert_all
+
+        # Gather global distribution
+        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
+            num_local_tokens_per_expert,
+            group=self.ep_group
+        ).reshape(self.ep_size, self.num_experts).to(torch.int64)
+
+        # Extract local expert columns
+        local_expert_start = self.local_expert_indices[0]
+        local_expert_end = self.local_expert_indices[-1] + 1
+        num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, local_expert_start:local_expert_end]
+
+        # Compute splits
+        # output_splits: tokens received per rank (sent to local experts)
+        output_splits = num_global_tokens_per_local_expert.sum(dim=-1).to(
+            torch.device("cpu"), non_blocking=True)
+
+        # input_splits: tokens sent per rank
+        input_splits = num_global_tokens_per_expert[self.ep_rank].reshape(
+            self.ep_size, self.num_local_experts).sum(dim=1).to(
+                torch.device("cpu"), non_blocking=True)
+
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+
+        # Compute global_input_tokens_local_experts_indices
+        global_input_tokens_local_experts_indices = None
+        if self.num_local_experts > 1:
+            global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.flatten()
+            )
+
+        # Compute token counts
+        num_out_tokens_before_drop = T_local * actual_topk
+        num_out_tokens_after_drop = int(input_splits.sum().item())
+
+        return (
+            num_tokens_per_local_expert,
+            input_splits.numpy(),
+            output_splits.numpy(),
+            num_global_tokens_per_local_expert,
+            global_input_tokens_local_experts_indices,
+            num_out_tokens_before_drop,
+            num_out_tokens_after_drop,
+        )
+
+    def token_combine(self, hidden_states, context_metadata, bias=None):
+        """Token combine for unified dispatcher."""
+        assert bias is None
+
+        # 1. Preprocess - undo local expert grouping
+        hidden_states = self._combine_preprocess(hidden_states, context_metadata)
+
+        # 2. All2all
+        _, permutated_local_input_tokens, all2all_handle = async_all_to_all(
+            hidden_states,
+            context_metadata["input_splits"],
+            context_metadata["output_splits"],
+            self.ep_group,
+        )
+        all2all_handle.wait()
+        hidden_states.untyped_storage().resize_(0)
+
+        # 3. Reconstruct full permuted tensor
+        num_out_tokens_before_drop = context_metadata["num_out_tokens_before_drop"]
+
+        restored_local_tokens = torch.zeros(
+            (num_out_tokens_before_drop, permutated_local_input_tokens.shape[-1]),
+            dtype=permutated_local_input_tokens.dtype,
+            device=permutated_local_input_tokens.device,
+        )
+
+        restored_local_tokens[:self.num_out_tokens] = permutated_local_input_tokens
+        permutated_local_input_tokens.untyped_storage().resize_(0)
+
+        # 4. Unpermute with full reversed mapping
+        full_reversed_mapping = context_metadata["full_reversed_local_input_permutation_mapping"]
+
+        output = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=restored_local_tokens,
+            sorted_indices=full_reversed_mapping.to(torch.int32),
+            probs=context_metadata["topk_weights"],
+            restore_shape=self.hidden_shape_before_permute,
+        )
+
+        output = output.view(self.hidden_shape)
+        return TokenCombineResult(routed_out=output)
+
+
 class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
     def __init__(self, **kwargs):
