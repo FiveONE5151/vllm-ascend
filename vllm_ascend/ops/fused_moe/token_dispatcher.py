@@ -1137,79 +1137,6 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
         global_topk_ids = global_topk_ids.masked_fill(~keep_mask,
                                                        self.num_experts)
         return global_topk_weights, global_topk_ids
-    
-    def _get_topk_ids_weights_after_expanded_drop_by_expert(
-            self, global_topk_ids: torch.Tensor, global_topk_weights: torch.Tensor, global_router_logits: torch.Tensor, expert_capacity: int
-    ):
-        mask_buffer = torch.zeros((global_topk_ids.shape[0], self.num_experts),
-                                  dtype=torch.bool,
-                                  device=global_topk_ids.device)
-        scores_buffer = torch.zeros((global_topk_ids.shape[0], self.num_experts),
-                                  dtype=global_topk_weights.dtype,
-                                  device=global_topk_ids.device)
-
-        # get each rank's local expert indices
-        # and repeat them according to each rank's local tokens in global_topk_ids, so that we can mark the local experts for each token in global_topk_ids
-        num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
-        token_ranges = self._rank_token_ranges(num_tokens_across_dp)
-
-        # 为每个token分配其所属rank的本地专家索引
-        rank_ids = torch.zeros(global_topk_ids.shape[0], dtype=torch.int64, device=global_topk_ids.device)
-        for rank, (start, end) in enumerate(token_ranges):
-            rank_ids[start:end] = rank
-
-        # 计算每个token对应的本地专家索引范围起点
-        rank_experts_start_idx = rank_ids * self.num_local_experts
-
-        # 生成所有本地专家索引（每个rank的所有本地专家）
-        all_local_expert_ids = torch.arange(self.num_local_experts, device=global_topk_ids.device)
-
-        # 向量化构造：[num_tokens, num_local_experts]
-        local_expert_indices_t = rank_experts_start_idx.unsqueeze(-1) + all_local_expert_ids.unsqueeze(0)
-
-        # [T, topk+num_local_experts], 
-        # 先把原本被gating topk选中的tokens和expert位置标记为True，
-        # 再把所有token所在rank的local expert的位置也标记为True
-        expand_global_topk_ids = torch.cat([global_topk_ids, local_expert_indices_t], dim=-1)
-
-        # [num_global_tokens, num_experts]
-        # 当前router logits中，被gating topk选中的tokens和expert位置被标记为True,
-        # 以及每个token所在rank的local expert位置也被标记为True
-        mask_buffer.scatter_(-1, expand_global_topk_ids, True)
-        scores_buffer.scatter_(-1, expand_global_topk_ids, global_router_logits)
-
-
-        capacity = min(expert_capacity, scores_buffer.shape[0])
-
-        # 对于没被topk选中的token-expert位置, 填上inf用于后续capacity topk
-        masked_scores = scores_buffer.masked_fill(~mask_buffer,
-                                                    float('-inf'))
-        _, capacity_indices = torch.topk(masked_scores,
-                                            k=capacity,
-                                            dim=0,
-                                            sorted=False)
-
-        # [num_global_tokens, num_global_experts]，
-        # 被gating选中且不超过容量限制的位置, 以及每个token所在rank的local expert位置
-        # 被标记为True
-        kept_mask = torch.zeros_like(mask_buffer).scatter(
-            0, capacity_indices, True) & mask_buffer
-
-        # [num_global_tokens, topk+num_local_experts]
-        top_mask = kept_mask.gather(-1, expand_global_topk_ids)
-
-        # [num_global_tokens, topk+num_local_experts]
-        expanded_global_topk_weights = scores_buffer.gather(-1, expand_global_topk_ids)
-
-        # 把最终被选中且不超过容量限制的位置的权重保留，其他位置的权重设置为0
-        # [T, topk+num_local_experts]
-        expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(
-            global_topk_weights.dtype)
-
-        # 把最终被选中但超过容量限制的位置的expert index设置为num_experts (sentinel)，表示这些token将被丢弃
-        expand_global_topk_ids = expand_global_topk_ids.masked_fill(~top_mask, self.num_experts)
-
-        return expanded_global_topk_weights, expand_global_topk_ids
 
     def _preprocess_with_token_drop(self,
                                     topk_ids: torch.Tensor,
@@ -1668,6 +1595,8 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         # Expanded drop specific parameters
         self.token_drop_load_factor = kwargs.get("token_drop_load_factor", 1.0)
         self.expanded_topk = self.top_k + self.num_local_experts  # expanded candidate count
+        self.drop_strategy = os.getenv("VLLM_TOKEN_DROP_STRATEGY",
+                                       "expert_expanded_drop")
 
         # Logging and statistics configuration
         self.token_drop_logging = os.getenv("VLLM_TOKEN_DROP_LOGGING", "0") == "1"
@@ -1677,7 +1606,8 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         logger.info(
             f"[ExpandedDrop] Initialized TokenDispatcherWithAll2AllvExpandedDrop with "
             f"token_drop_load_factor={self.token_drop_load_factor}, "
-            f"expanded_topk={self.expanded_topk} (original_topk={self.top_k}, num_local_experts={self.num_local_experts})"
+            f"expanded_topk={self.expanded_topk} (original_topk={self.top_k}, num_local_experts={self.num_local_experts}), "
+            f"strategy={self.drop_strategy}"
         )
 
     def _log_token_drop_statistics(
@@ -1890,6 +1820,149 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         )
         return expanded_global_topk_weights, expand_global_topk_ids
 
+    def _get_topk_ids_weights_after_expanded_drop_by_device(
+            self,
+            global_topk_ids: torch.Tensor,          # [T, topk]
+            global_topk_weights: torch.Tensor,      # [T, topk]
+            global_router_logits: torch.Tensor,     # [T, num_experts]
+            device_capacity: int,
+            num_tokens_across_dp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expanded candidates first, then drop by per-device capacity."""
+        del global_topk_ids, global_topk_weights
+
+        T = global_router_logits.shape[0]
+        if T == 0:
+            return (
+                torch.zeros((0, self.expanded_topk),
+                            dtype=torch.float32,
+                            device=global_router_logits.device),
+                torch.zeros((0, self.expanded_topk),
+                            dtype=torch.int64,
+                            device=global_router_logits.device),
+            )
+
+        device = global_router_logits.device
+        router_probs = torch.softmax(global_router_logits, dim=-1)
+        _, topk_ids_from_probs = torch.topk(
+            router_probs.to(torch.float32),
+            k=self.top_k,
+            dim=-1,
+        )
+        topk_ids_from_probs = topk_ids_from_probs.to(torch.int64)
+
+        token_ranges = self._rank_token_ranges(num_tokens_across_dp)
+        rank_ids = torch.zeros(T, dtype=torch.int64, device=device)
+        for rank, (start, end) in enumerate(token_ranges):
+            rank_ids[start:end] = rank
+
+        rank_experts_start_idx = rank_ids * self.num_local_experts
+        all_local_expert_ids = torch.arange(self.num_local_experts,
+                                            device=device,
+                                            dtype=torch.int64)
+        local_expert_indices_t = rank_experts_start_idx.unsqueeze(
+            -1) + all_local_expert_ids.unsqueeze(0)
+
+        expand_global_topk_ids = torch.cat(
+            [topk_ids_from_probs, local_expert_indices_t], dim=-1)
+        expanded_global_topk_weights = router_probs.gather(
+            -1, expand_global_topk_ids)
+
+        # Keep top-k positions as primary when expanded local experts duplicate.
+        # [T, expanded_topk], True for candidates, False for non-candidates
+        candidate_mask = torch.ones_like(expand_global_topk_ids,
+                                         dtype=torch.bool,
+                                         device=device)
+
+        # Deduplication
+        for pos in range(self.top_k, self.expanded_topk):
+            duplicate_mask = (
+                expand_global_topk_ids[:, pos:pos + 1]
+                == expand_global_topk_ids[:, :pos]).any(dim=-1)
+            candidate_mask[:, pos] = candidate_mask[:, pos] & ~duplicate_mask
+
+        if device_capacity <= 0:
+            return (
+                torch.zeros_like(expanded_global_topk_weights),
+                torch.full_like(expand_global_topk_ids, self.num_experts),
+            )
+
+        # [T * expanded_topk] flatten for sorting and selection
+        flat_ids = expand_global_topk_ids.reshape(-1)
+        # [T * expanded_topk] flatten weights
+        flat_weights = expanded_global_topk_weights.reshape(-1)
+        # [T * expanded_topk] flatten valid mask after deduplication
+        flat_valid = candidate_mask.reshape(-1)
+
+        # [T * expanded_topk] corresponding device ids for each token-expert pair
+        device_ids_all = torch.div(flat_ids,
+                                   self.num_local_experts,
+                                   rounding_mode='floor')
+        minus_inf = torch.full_like(flat_weights, float('-inf'))
+
+        # fill non-candidate positions with -inf so they will be sorted to the end and dropped first
+        # now candidate positions are chosen after topk and expanded, and deduplicated
+        sortable_scores = torch.where(flat_valid, flat_weights, minus_inf)
+
+        # sort by scores first
+        score_order = torch.argsort(sortable_scores, descending=True)
+        sorted_scores_indices = score_order
+
+        # Got sorted in scores device ids of token-expert pair
+        # [T * expanded_topk]
+        sorted_device_ids = device_ids_all.index_select(0, score_order).to(
+            dtype=torch.float32)
+
+        # sort by device id to group tokens of the same device together, 
+        # while keeping the score order stable within each device group (stable)
+        device_order = torch.argsort(sorted_device_ids, stable=True)
+
+        # got sorted by score and device topk indices, device ids, and valid mask
+        sorted_indices = sorted_scores_indices.index_select(0, device_order)
+        sorted_device_ids = sorted_device_ids.index_select(0, device_order)
+        sorted_valid = flat_valid.index_select(0, sorted_indices)
+
+        sorted_len = sorted_device_ids.shape[0]
+
+        # [T * expanded_topk] arange for indexing
+        arange_sorted = torch.arange(sorted_len,
+                                     device=device,
+                                     dtype=torch.int64)
+        # [T * expanded_topk] find group boundaries where device id changes
+        group_start_flags = torch.ones_like(sorted_device_ids, dtype=torch.bool)
+
+        # mark the beginning of a device to be true, others are false
+        group_start_flags[1:] = sorted_device_ids[1:] != sorted_device_ids[:-1]
+        # [Num devices] group start indices in the sorted array
+        group_starts = arange_sorted[group_start_flags]
+        # [Num devices] group ids for each position in the sorted array
+        group_ids = torch.cumsum(group_start_flags.to(torch.int64), dim=0) - 1
+        # [Num devices] rank of each token in its device group
+        rank_in_device = arange_sorted - group_starts.index_select(0, group_ids)
+
+        keep_in_sorted = (rank_in_device < device_capacity) & sorted_valid
+        kept_indices = sorted_indices.index_select(
+            0, torch.nonzero(keep_in_sorted, as_tuple=False).squeeze(-1))
+
+        keep_mask_flat = torch.zeros_like(flat_ids, dtype=torch.bool)
+        keep_mask_flat.scatter_(0, kept_indices, True)
+        keep_mask = keep_mask_flat.view_as(expand_global_topk_ids)
+
+        expanded_global_topk_weights = expanded_global_topk_weights * keep_mask.to(
+            expanded_global_topk_weights.dtype)
+        expand_global_topk_ids = expand_global_topk_ids.masked_fill(
+            ~keep_mask, self.num_experts)
+
+        row_sum = expanded_global_topk_weights.sum(dim=-1, keepdim=True)
+        eps = torch.finfo(expanded_global_topk_weights.dtype).eps
+        nonzero_mask = row_sum > eps
+        expanded_global_topk_weights = torch.where(
+            nonzero_mask,
+            expanded_global_topk_weights / row_sum.clamp_min(eps),
+            torch.zeros_like(expanded_global_topk_weights),
+        )
+        return expanded_global_topk_weights, expand_global_topk_ids
+
     def _compute_num_global_tokens_per_expert_after_drop(
             self,
             global_topk_ids_after_drop: torch.Tensor,  # [T, expanded_topk]
@@ -1995,16 +2068,30 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
         expert_capacity = math.ceil(
             T_global * self.top_k * self.token_drop_load_factor / self.num_experts
         )
+        device_capacity = math.ceil(expert_capacity * self.num_local_experts)
 
-        # Step 5: Execute expanded drop (with deduplication)
-        global_topk_weights_after_drop, global_topk_ids_after_drop = \
-            self._get_topk_ids_weights_after_expanded_drop_by_expert(
-                global_topk_ids,  # Only original topk for initial ids
-                global_topk_weights,
-                global_router_logits,
-                expert_capacity,
-                num_tokens_across_dp,
-            )
+        # Step 5: Execute expanded drop strategy.
+        if self.drop_strategy == "expert_expanded_drop":
+            global_topk_weights_after_drop, global_topk_ids_after_drop = \
+                self._get_topk_ids_weights_after_expanded_drop_by_expert(
+                    global_topk_ids,
+                    global_topk_weights,
+                    global_router_logits,
+                    expert_capacity,
+                    num_tokens_across_dp,
+                )
+        elif self.drop_strategy == "device_expanded_drop":
+            global_topk_weights_after_drop, global_topk_ids_after_drop = \
+                self._get_topk_ids_weights_after_expanded_drop_by_device(
+                    global_topk_ids,
+                    global_topk_weights,
+                    global_router_logits,
+                    device_capacity,
+                    num_tokens_across_dp,
+                )
+        else:
+            raise ValueError(
+                f"Invalid expanded drop strategy: {self.drop_strategy}")
 
         # Step 6: Compute after_drop statistics
         num_global_tokens_per_expert_after_drop = self._compute_num_global_tokens_per_expert_after_drop(
@@ -2052,7 +2139,7 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
                 num_global_tokens_per_expert_before_drop=num_global_tokens_per_expert_before_drop,
                 num_global_tokens_per_expert_after_drop=num_global_tokens_per_expert_after_drop,
                 expert_capacity=expert_capacity,
-                device_capacity=expert_capacity * self.num_local_experts,
+                device_capacity=device_capacity,
                 step=step,
             )
 
@@ -2184,7 +2271,9 @@ class TokenDispatcherWithAll2AllvExpandedDrop(TokenDispatcherWithAll2AllV):
             "num_out_tokens_after_drop": num_out_tokens_after_drop,
             "original_topk": self.top_k,
             "expanded_topk": self.expanded_topk,
+            "drop_strategy": self.drop_strategy,
             "expert_capacity": expert_capacity,
+            "device_capacity": expert_capacity * self.num_local_experts,
             "num_global_tokens_per_expert_before_drop": num_global_tokens_per_expert_before_drop,
             "num_global_tokens_per_local_expert_after_drop": num_global_tokens_per_local_expert,
         }

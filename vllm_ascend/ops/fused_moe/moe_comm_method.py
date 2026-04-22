@@ -256,7 +256,7 @@ class AlltoAllCommImpl(MoECommMethod):
     def _get_token_dispatcher(self):
         if envs_ascend.VLLM_ENABLE_TOKEN_DROP:
             token_drop_strategy = os.getenv("VLLM_TOKEN_DROP_STRATEGY", "expert_drop")
-            if token_drop_strategy == "expert_expanded_drop":
+            if token_drop_strategy in ["expert_expanded_drop", "device_expanded_drop"]:
                 logger.info(f"[ExpandedDrop] Using TokenDispatcherWithAll2AllvExpandedDrop with load factor {envs_ascend.VLLM_TOKEN_DROP_LOAD_FACTOR}")
                 return TokenDispatcherWithAll2AllvExpandedDrop(
                     top_k=self.moe_config.experts_per_token,
