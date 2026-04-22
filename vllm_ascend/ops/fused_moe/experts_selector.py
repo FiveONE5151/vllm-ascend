@@ -14,11 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 import torch
+import torch_npu.distributed
+from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.utils import get_weight_prefetch_method
+
+if TYPE_CHECKING:
+    from vllm_ascend.ops.fused_moe.token_drop_strategy import (
+        ExpertDropLocalStrategy, TokenDropStrategy)
 
 
 def select_experts(hidden_states: torch.Tensor,
@@ -36,7 +43,12 @@ def select_experts(hidden_states: torch.Tensor,
                    mix_placement: Optional[bool] = False,
                    num_logical_experts: int = -1,
                    num_shared_experts: int = 0,
-                   global_num_experts: int = -1):
+                   global_num_experts: int = -1,
+                   token_drop_strategy: Optional["TokenDropStrategy"] = None,
+                   num_local_experts: int = 0,
+                   ep_rank: int = 0,
+                   ep_size: int = 1,
+                   ep_group=None):
     """
     Fused experts with select experts.
 
@@ -53,6 +65,11 @@ def select_experts(hidden_states: torch.Tensor,
         e_score_correction_bias: Correction bias to apply to expert scores.
         indices_type: dtype of indices
         global_num_experts: Global number of experts.
+        token_drop_strategy: Optional token drop strategy to apply after topk selection.
+        num_local_experts: Number of local experts per EP rank.
+        ep_rank: Current EP rank.
+        ep_size: Total EP world size.
+        ep_group: EP process group for communication.
 
     Returns:
         topk_weights: router weights of shape (num_tokens, top_k).
@@ -99,6 +116,22 @@ def select_experts(hidden_states: torch.Tensor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
         )
+
+    # Apply token drop strategy if provided
+    if token_drop_strategy is not None:
+        topk_weights, topk_ids = _apply_token_drop_strategy(
+            scores=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+            token_drop_strategy=token_drop_strategy,
+            num_experts=global_num_experts,
+            num_local_experts=num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            ep_group=ep_group,
+        )
+
     if mix_placement:
         shared_expert_routing_factor = 0.4
         batch_size = topk_ids.shape[0]
@@ -118,6 +151,121 @@ def select_experts(hidden_states: torch.Tensor,
         topk_weights = torch.cat([topk_weights, pad_shared_expert_weights],
                                  dim=1)
     return topk_weights, topk_ids
+
+
+def _apply_token_drop_strategy(
+    scores: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    token_drop_strategy: "TokenDropStrategy",
+    num_experts: int,
+    num_local_experts: int,
+    ep_rank: int,
+    ep_size: int,
+    ep_group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply token drop strategy, handling global gather if needed.
+
+    Args:
+        scores: Router scores [T_local, num_experts]
+        topk_weights: Topk weights [T_local, topk]
+        topk_ids: Topk expert IDs [T_local, topk]
+        router_logits: Router logits [T_local, num_experts]
+        token_drop_strategy: Strategy to apply
+        num_experts: Total number of global experts
+        num_local_experts: Number of local experts per rank
+        ep_rank: Current EP rank
+        ep_size: Total EP world size
+        ep_group: EP process group
+
+    Returns:
+        Tuple of (topk_weights, topk_ids) after applying token drop
+    """
+    global_topk_ids = None
+    global_topk_weights = None
+    global_router_logits = None
+    num_tokens_across_dp = None
+
+    if token_drop_strategy.needs_global_gather:
+        # Get token distribution across DP
+        try:
+            num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+        except AssertionError:
+            num_tokens_across_dp = torch.full(
+                (ep_size,), topk_ids.shape[0],
+                dtype=torch.int64, device=torch.device("cpu"))
+
+        T_global = int(num_tokens_across_dp.sum().item())
+
+        if token_drop_strategy.is_expanded:
+            # Expanded strategies need global router_logits
+            global_router_logits = torch.zeros(
+                (T_global, router_logits.shape[1]),
+                dtype=router_logits.dtype,
+                device=router_logits.device)
+            global_topk_ids = torch.zeros(
+                (T_global, topk_ids.shape[1]),
+                dtype=topk_ids.dtype,
+                device=topk_ids.device)
+            global_topk_weights = torch.zeros(
+                (T_global, topk_weights.shape[1]),
+                dtype=topk_weights.dtype,
+                device=topk_weights.device)
+
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_router_logits, router_logits,
+                num_tokens_across_dp.numpy(), group=ep_group)
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_topk_ids, topk_ids,
+                num_tokens_across_dp.numpy(), group=ep_group)
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_topk_weights, topk_weights,
+                num_tokens_across_dp.numpy(), group=ep_group)
+        else:
+            # Non-expanded strategies need global topk_ids and topk_weights
+            global_topk_ids = torch.zeros(
+                (T_global, topk_ids.shape[1]),
+                dtype=topk_ids.dtype,
+                device=topk_ids.device)
+            global_topk_weights = torch.zeros(
+                (T_global, topk_weights.shape[1]),
+                dtype=topk_weights.dtype,
+                device=topk_weights.device)
+
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_topk_ids, topk_ids,
+                num_tokens_across_dp.numpy(), group=ep_group)
+            torch_npu.distributed.all_gather_into_tensor_uneven(
+                global_topk_weights, topk_weights,
+                num_tokens_across_dp.numpy(), group=ep_group)
+
+            # # Also gather router_logits for non-local strategies that may need it
+            # if not isinstance(token_drop_strategy, ExpertDropLocalStrategy):
+            #     global_router_logits = torch.zeros(
+            #         (T_global, router_logits.shape[1]),
+            #         dtype=router_logits.dtype,
+            #         device=router_logits.device)
+            #     torch_npu.distributed.all_gather_into_tensor_uneven(
+            #         global_router_logits, router_logits,
+            #         num_tokens_across_dp.numpy(), group=ep_group)
+
+    # Apply the strategy
+    result = token_drop_strategy.apply(
+        scores=scores,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        global_topk_ids=global_topk_ids,
+        global_topk_weights=global_topk_weights,
+        global_router_logits=global_router_logits,
+        num_tokens_across_dp=num_tokens_across_dp,
+    )
+
+    return result.topk_weights, result.topk_ids
 
 
 def check_npu_moe_gating_top_k(

@@ -45,6 +45,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (AllGatherCommImpl,
                                                        FusedExpertsResult,
                                                        setup_moe_comm_method)
 from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
+from vllm_ascend.ops.fused_moe.token_drop_strategy import (
+    TokenDropStrategy, create_token_drop_strategy)
 from vllm_ascend.quantization.w4a8_dynamic import \
     AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.w8a8_dynamic import \
@@ -252,6 +254,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
               expert_map: Optional[torch.Tensor] = None,
               apply_router_weight_on_input: bool = False,
               enable_force_load_balance: bool = False,
+              token_drop_strategy: Optional[TokenDropStrategy] = None,
+              num_local_experts: int = 0,
+              ep_rank: int = 0,
+              ep_size: int = 1,
+              ep_group=None,
               **kwargs) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -267,7 +274,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
+            global_num_experts=global_num_experts,
+            token_drop_strategy=token_drop_strategy,
+            num_local_experts=num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            ep_group=ep_group)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -395,6 +407,19 @@ class AscendFusedMoE(FusedMoE):
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
 
+        # Create token drop strategy if enabled
+        self.token_drop_strategy: Optional[TokenDropStrategy] = None
+        if envs.VLLM_ENABLE_TOKEN_DROP:
+            strategy_name = os.getenv("VLLM_TOKEN_DROP_STRATEGY", "expert_drop")
+            load_factor = envs.VLLM_TOKEN_DROP_LOAD_FACTOR
+            local_only = envs.VLLM_TOKEN_DROP_LOCAL_ONLY
+            self.token_drop_strategy = create_token_drop_strategy(
+                strategy_name=strategy_name,
+                load_factor=load_factor,
+                local_only=local_only,
+                top_k=self.top_k,
+            )
+
     def _get_quant_type(self) -> QuantType:
         quant_method = self.quant_method
         if not hasattr(quant_method,
@@ -475,7 +500,12 @@ class AscendFusedMoE(FusedMoE):
                     scoring_func=self.scoring_func,
                     routed_scaling_factor=self.routed_scaling_factor,
                     e_score_correction_bias=self.e_score_correction_bias,
-                    global_num_experts=self.global_num_experts)
+                    global_num_experts=self.global_num_experts,
+                    token_drop_strategy=self.token_drop_strategy,
+                    num_local_experts=self.local_num_experts,
+                    ep_rank=self.ep_rank,
+                    ep_size=self.ep_size,
+                    ep_group=get_ep_group().device_group)
 
                 if isinstance(forward_context.moe_comm_method,
                               AllGatherCommImpl):
@@ -525,7 +555,12 @@ class AscendFusedMoE(FusedMoE):
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
-            mc2_mask=mc2_mask)
+            mc2_mask=mc2_mask,
+            token_drop_strategy=self.token_drop_strategy,
+            num_local_experts=self.local_num_experts,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            ep_group=get_ep_group().device_group)
 
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens
