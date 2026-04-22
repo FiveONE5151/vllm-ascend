@@ -1377,13 +1377,6 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
 
         self.num_out_tokens_after_drop = int(input_splits.sum().item())
 
-        local_permute_keep_indices = self._get_local_permute_keep_indices_from_topk(
-            topk_ids,
-            local_topk_ids_after_drop,
-            num_local_tokens_per_expert,
-            topk_ids.device,
-        )
-
         if self.token_drop_logging:
             self._log_token_drop_statistics(
                 num_global_tokens_per_expert_before_drop=
@@ -1401,10 +1394,11 @@ class TokenDispatcherWithAll2AllvTokenDrop(TokenDispatcherWithAll2AllV):
             output_splits.numpy(),
             num_global_tokens_per_local_expert,
             global_input_tokens_local_experts_indices,
-            local_permute_keep_indices,
             expert_capacity,
             global_avg_tokens_per_expert,
             num_global_tokens_per_expert,
+            local_topk_ids_after_drop,
+            local_topk_weights_after_drop,
         )
 
     @override
