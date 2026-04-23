@@ -37,6 +37,8 @@ from vllm.distributed.parallel_state import get_ep_group
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import (
     async_all_to_all, gather_from_sequence_parallel_region)
+from vllm_ascend.ops.fused_moe.token_drop_utils import \
+    compute_num_global_tokens_per_expert_after_drop
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                is_hierarchical_communication_enabled)
 
@@ -812,35 +814,40 @@ class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
             num_out_tokens_before_drop: T_local * expanded_topk (or topk)
             num_out_tokens_after_drop: actual kept token count
         """
-        device = topk_ids.device
         T_local = topk_ids.shape[0]
         actual_topk = topk_ids.shape[1]  # Could be topk or topk + num_local_experts
 
-        # Count valid tokens (non-sentinel)
-        valid_mask = topk_ids < self.num_experts
+        # Keep the same global-stat flow as token-drop/expanded-drop paths.
+        try:
+            num_tokens_across_dp = get_forward_context(
+            ).dp_metadata.num_tokens_across_dp_cpu
+        except AssertionError:
+            num_tokens_across_dp = torch.full(
+                (self.ep_size, ),
+                T_local,
+                dtype=torch.int64,
+                device=torch.device("cpu"),
+            )
 
-        # Local tokens per expert (only valid ones)
-        valid_topk_ids = topk_ids.masked_fill(~valid_mask, 0)
-        num_local_tokens_per_expert_all = torch.histc(
-            valid_topk_ids.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts - 1
-        ).to(torch.int64)
+        T_global = int(num_tokens_across_dp.sum().item())
+        global_topk_ids_after_drop = torch.zeros(
+            (T_global, actual_topk),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        torch_npu.distributed.all_gather_into_tensor_uneven(
+            global_topk_ids_after_drop,
+            topk_ids,
+            num_tokens_across_dp.numpy(),
+            group=self.ep_group,
+        )
 
-        # Adjust counts: subtract invalid sentinel placeholders
-        num_sentinel_per_expert = torch.zeros(
-            self.num_experts, dtype=torch.int64, device=device)
-        # Sentinel tokens are marked as num_experts, which we need to exclude
-        # Since we used min=0, max=num_experts-1 in histc, sentinels aren't counted
-        # But we need to count how many sentinel tokens exist
-        num_local_tokens_per_expert = num_local_tokens_per_expert_all
-
-        # Gather global distribution
-        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=self.ep_group
-        ).reshape(self.ep_size, self.num_experts).to(torch.int64)
+        num_global_tokens_per_expert = compute_num_global_tokens_per_expert_after_drop(
+            global_topk_ids_after_drop,
+            num_tokens_across_dp,
+            self.num_experts,
+            self.ep_size,
+        )
 
         # Extract local expert columns
         local_expert_start = self.local_expert_indices[0]

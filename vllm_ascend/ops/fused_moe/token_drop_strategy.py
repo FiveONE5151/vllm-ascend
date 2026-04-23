@@ -45,6 +45,10 @@ from vllm_ascend.ops.fused_moe.token_drop_utils import (
 )
 
 
+_GLOBAL_TOKEN_DROP_STRATEGY: Optional["TokenDropStrategy"] = None
+_GLOBAL_TOKEN_DROP_STRATEGY_CONFIG: Optional[tuple] = None
+
+
 @dataclass
 class TokenDropResult:
     """Result of applying a token drop strategy.
@@ -173,26 +177,27 @@ class ExpertDropStrategy(TokenDropStrategy):
             self._drop_by_expert(global_topk_ids, global_topk_weights,
                                  expert_capacity, num_experts)
 
-        # Compute per-rank after-drop results
-        num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
-            global_topk_ids_after_drop, num_tokens_across_dp, num_experts, ep_size)
-
         # Extract this rank's results
         token_ranges_list = rank_token_ranges(num_tokens_across_dp, ep_size)
         this_rank_start, this_rank_end = token_ranges_list[ep_rank]
         this_rank_topk_ids_after_drop = global_topk_ids_after_drop[this_rank_start:this_rank_end, :]
         this_rank_topk_weights_after_drop = global_topk_weights_after_drop[this_rank_start:this_rank_end, :]
 
-        # Compute global before-drop stats for logging
-        num_local_tokens_per_expert = torch.histc(
-            topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
-        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
 
-        # Logging
-        step = self._maybe_increment_step()
         if self.token_drop_logging:
+            # Logging
+            step = self._maybe_increment_step()
+            # Compute per-rank after-drop results
+            num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
+            global_topk_ids_after_drop, num_tokens_across_dp, num_experts, ep_size)
+
+            # Compute global before-drop stats for logging
+            num_local_tokens_per_expert = torch.histc(
+                topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
+            num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
             log_token_drop_statistics(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
@@ -206,20 +211,7 @@ class ExpertDropStrategy(TokenDropStrategy):
                 num_local_experts=num_local_experts,
             )
 
-        return TokenDropResult(
-            topk_weights=this_rank_topk_weights_after_drop,
-            topk_ids=this_rank_topk_ids_after_drop,
-            context_metadata={
-                "expert_capacity": expert_capacity,
-                "device_capacity": device_capacity,
-                "global_avg_tokens_per_expert_before_drop":
-                    float(num_global_tokens_per_expert_before_drop.sum()) / float(num_experts),
-                "num_global_tokens_per_expert_before_drop":
-                    num_global_tokens_per_expert_before_drop,
-                "num_global_tokens_per_expert_after_drop":
-                    num_global_tokens_per_expert_after_drop,
-            },
-        )
+        return this_rank_topk_weights_after_drop, this_rank_topk_ids_after_drop
 
     def _drop_by_expert(
         self,
@@ -324,26 +316,27 @@ class DeviceDropStrategy(TokenDropStrategy):
             self._drop_by_device(global_topk_ids, global_topk_weights,
                                  device_capacity, num_experts, num_local_experts)
 
-        # Compute per-rank after-drop results
-        num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
-            global_topk_ids_after_drop, num_tokens_across_dp, num_experts, ep_size)
-
         # Extract this rank's results
         token_ranges_list = rank_token_ranges(num_tokens_across_dp, ep_size)
         this_rank_start, this_rank_end = token_ranges_list[ep_rank]
         this_rank_topk_ids_after_drop = global_topk_ids_after_drop[this_rank_start:this_rank_end, :]
         this_rank_topk_weights_after_drop = global_topk_weights_after_drop[this_rank_start:this_rank_end, :]
 
-        # Compute global before-drop stats for logging
-        num_local_tokens_per_expert = torch.histc(
-            topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
-        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
-
-        # Logging
-        step = self._maybe_increment_step()
         if self.token_drop_logging:
+            # Logging
+            step = self._maybe_increment_step()
+
+            # Compute per-rank after-drop results
+            num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
+                global_topk_ids_after_drop, num_tokens_across_dp, num_experts, ep_size)
+
+            # Compute global before-drop stats for logging
+            num_local_tokens_per_expert = torch.histc(
+                topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
+            num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
             log_token_drop_statistics(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
@@ -357,20 +350,7 @@ class DeviceDropStrategy(TokenDropStrategy):
                 num_local_experts=num_local_experts,
             )
 
-        return TokenDropResult(
-            topk_weights=this_rank_topk_weights_after_drop,
-            topk_ids=this_rank_topk_ids_after_drop,
-            context_metadata={
-                "expert_capacity": expert_capacity,
-                "device_capacity": device_capacity,
-                "global_avg_tokens_per_expert_before_drop":
-                    float(num_global_tokens_per_expert_before_drop.sum()) / float(num_experts),
-                "num_global_tokens_per_expert_before_drop":
-                    num_global_tokens_per_expert_before_drop,
-                "num_global_tokens_per_expert_after_drop":
-                    num_global_tokens_per_expert_after_drop,
-            },
-        )
+        return this_rank_topk_weights_after_drop, this_rank_topk_ids_after_drop
 
     def _drop_by_device(
         self,
@@ -502,21 +482,23 @@ class ExpertDropLocalStrategy(TokenDropStrategy):
             minlength=num_experts,
         ).to(torch.int64)
 
-        # Build global after-drop matrix for logging and splits
-        num_global_tokens_per_expert_after_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert_after_drop,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
 
-        # Before-drop stats
-        num_local_tokens_per_expert = torch.histc(
-            topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
-        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
-
-        # Logging
-        step = self._maybe_increment_step()
         if self.token_drop_logging:
+            # Logging
+            step = self._maybe_increment_step()
+
+            # Build global after-drop matrix for logging
+            num_global_tokens_per_expert_after_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert_after_drop,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
+            # Before-drop stats
+            num_local_tokens_per_expert = torch.histc(
+                topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
+            num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
             log_token_drop_statistics(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
@@ -530,20 +512,7 @@ class ExpertDropLocalStrategy(TokenDropStrategy):
                 num_local_experts=num_local_experts,
             )
 
-        return TokenDropResult(
-            topk_weights=local_topk_weights_after_drop,
-            topk_ids=local_topk_ids_after_drop,
-            context_metadata={
-                "expert_capacity": expert_capacity,
-                "device_capacity": device_capacity,
-                "global_avg_tokens_per_expert_before_drop":
-                    float(total_tokens * topk) / float(num_experts),
-                "num_global_tokens_per_expert_before_drop":
-                    num_global_tokens_per_expert_before_drop,
-                "num_global_tokens_per_expert_after_drop":
-                    num_global_tokens_per_expert_after_drop,
-            },
-        )
+        return local_topk_weights_after_drop, local_topk_ids_after_drop
 
     def _drop_by_expert_local(
         self,
@@ -699,25 +668,26 @@ class ExpertExpandedDropStrategy(TokenDropStrategy):
         # Safe renormalize
         expanded_global_topk_weights = renormalize_topk_weights(expanded_global_topk_weights)
 
-        # Compute after-drop stats
-        num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
-            expand_global_topk_ids, num_tokens_across_dp, num_experts, ep_size)
-
         # Extract this rank's results
         this_rank_start, this_rank_end = token_ranges_list[ep_rank]
         topk_ids_after_drop = expand_global_topk_ids[this_rank_start:this_rank_end, :]
         topk_weights_after_drop = expanded_global_topk_weights[this_rank_start:this_rank_end, :]
 
-        # Before-drop stats
-        num_local_tokens_per_expert = torch.histc(
-            topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
-        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
-
-        # Logging
-        step = self._maybe_increment_step()
         if self.token_drop_logging:
+            # Logging
+            step = self._maybe_increment_step()
+
+            # Compute after-drop stats
+            num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
+                expand_global_topk_ids, num_tokens_across_dp, num_experts, ep_size)
+
+            # Before-drop stats
+            num_local_tokens_per_expert = torch.histc(
+                topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
+            num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
             log_token_drop_statistics(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
@@ -731,20 +701,7 @@ class ExpertExpandedDropStrategy(TokenDropStrategy):
                 num_local_experts=num_local_experts,
             )
 
-        return TokenDropResult(
-            topk_weights=topk_weights_after_drop,
-            topk_ids=topk_ids_after_drop,
-            context_metadata={
-                "expert_capacity": expert_capacity,
-                "device_capacity": device_capacity,
-                "global_avg_tokens_per_expert_before_drop":
-                    float(num_global_tokens_per_expert_before_drop.sum()) / float(num_experts),
-                "num_global_tokens_per_expert_before_drop":
-                    num_global_tokens_per_expert_before_drop,
-                "num_global_tokens_per_expert_after_drop":
-                    num_global_tokens_per_expert_after_drop,
-            },
-        )
+        return topk_weights_after_drop, topk_ids_after_drop
 
     def _maybe_increment_step(self) -> int:
         ctx = get_forward_context()
@@ -914,25 +871,26 @@ class DeviceExpandedDropStrategy(TokenDropStrategy):
         # Safe renormalize
         expanded_global_topk_weights = renormalize_topk_weights(expanded_global_topk_weights)
 
-        # Compute after-drop stats
-        num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
-            expand_global_topk_ids, num_tokens_across_dp, num_experts, ep_size)
-
         # Extract this rank's results
         this_rank_start, this_rank_end = token_ranges_list[ep_rank]
         topk_ids_after_drop = expand_global_topk_ids[this_rank_start:this_rank_end, :]
         topk_weights_after_drop = expanded_global_topk_weights[this_rank_start:this_rank_end, :]
 
-        # Before-drop stats
-        num_local_tokens_per_expert = torch.histc(
-            topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
-        num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
-
-        # Logging
-        step = self._maybe_increment_step()
         if self.token_drop_logging:
+            # Logging
+            step = self._maybe_increment_step()
+
+            # Compute after-drop stats
+            num_global_tokens_per_expert_after_drop = compute_num_global_tokens_per_expert_after_drop(
+                expand_global_topk_ids, num_tokens_across_dp, num_experts, ep_size)
+
+            # Before-drop stats
+            num_local_tokens_per_expert = torch.histc(
+                topk_ids, bins=num_experts, min=0, max=num_experts).to(torch.int64)
+            num_global_tokens_per_expert_before_drop = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert,
+                group=get_ep_group().device_group).reshape(ep_size, num_experts).to(torch.int64)
+
             log_token_drop_statistics(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
@@ -946,20 +904,7 @@ class DeviceExpandedDropStrategy(TokenDropStrategy):
                 num_local_experts=num_local_experts,
             )
 
-        return TokenDropResult(
-            topk_weights=topk_weights_after_drop,
-            topk_ids=topk_ids_after_drop,
-            context_metadata={
-                "expert_capacity": expert_capacity,
-                "device_capacity": device_capacity,
-                "global_avg_tokens_per_expert_before_drop":
-                    float(num_global_tokens_per_expert_before_drop.sum()) / float(num_experts),
-                "num_global_tokens_per_expert_before_drop":
-                    num_global_tokens_per_expert_before_drop,
-                "num_global_tokens_per_expert_after_drop":
-                    num_global_tokens_per_expert_after_drop,
-            },
-        )
+        return topk_weights_after_drop, topk_ids_after_drop
 
     def _maybe_increment_step(self) -> int:
         ctx = get_forward_context()
@@ -987,11 +932,40 @@ def create_token_drop_strategy(
     Returns:
         TokenDropStrategy instance
     """
-    if local_only:
+    global _GLOBAL_TOKEN_DROP_STRATEGY
+    global _GLOBAL_TOKEN_DROP_STRATEGY_CONFIG
+
+    effective_strategy_name = "expert_drop_local" if local_only else strategy_name
+    kwargs_signature = tuple(sorted((k, repr(v)) for k, v in kwargs.items()))
+    requested_config = (
+        effective_strategy_name,
+        float(load_factor),
+        bool(local_only),
+        int(top_k),
+        kwargs_signature,
+    )
+
+    if _GLOBAL_TOKEN_DROP_STRATEGY is not None:
+        if _GLOBAL_TOKEN_DROP_STRATEGY_CONFIG != requested_config:
+            raise ValueError(
+                "TokenDropStrategy singleton already initialized with a different configuration. "
+                f"existing={_GLOBAL_TOKEN_DROP_STRATEGY_CONFIG}, "
+                f"requested={requested_config}")
         logger.info(
-            f"[TokenDrop] Creating ExpertDropLocalStrategy with load_factor={load_factor}"
+            "[TokenDrop] Reusing global strategy instance: %s",
+            _GLOBAL_TOKEN_DROP_STRATEGY.__class__.__name__,
         )
-        return ExpertDropLocalStrategy(load_factor=load_factor, **kwargs)
+        return _GLOBAL_TOKEN_DROP_STRATEGY
+
+    if local_only:
+        strategy = ExpertDropLocalStrategy(load_factor=load_factor, **kwargs)
+        logger.info(
+            "[TokenDrop] Creating global ExpertDropLocalStrategy with load_factor=%s",
+            load_factor,
+        )
+        _GLOBAL_TOKEN_DROP_STRATEGY = strategy
+        _GLOBAL_TOKEN_DROP_STRATEGY_CONFIG = requested_config
+        return strategy
 
     strategies = {
         "expert_drop": ExpertDropStrategy,
@@ -1013,7 +987,11 @@ def create_token_drop_strategy(
         strategy = strategy_cls(load_factor=load_factor, **kwargs)
 
     logger.info(
-        f"[TokenDrop] Creating {strategy_cls.__name__} with "
-        f"load_factor={load_factor}, is_expanded={strategy.is_expanded}"
+        "[TokenDrop] Creating global %s with load_factor=%s, is_expanded=%s",
+        strategy_cls.__name__,
+        load_factor,
+        strategy.is_expanded,
     )
+    _GLOBAL_TOKEN_DROP_STRATEGY = strategy
+    _GLOBAL_TOKEN_DROP_STRATEGY_CONFIG = requested_config
     return strategy

@@ -20,7 +20,7 @@ import torch
 import torch_npu.distributed
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.forward_context import get_forward_context
-
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.utils import get_weight_prefetch_method
 
 if TYPE_CHECKING:
@@ -118,7 +118,8 @@ def select_experts(hidden_states: torch.Tensor,
         )
 
     # Apply token drop strategy if provided
-    if token_drop_strategy is not None:
+    ctx = get_forward_context()
+    if token_drop_strategy is not None and ctx.moe_comm_type == MoECommType.ALLTOALL:
         topk_weights, topk_ids = _apply_token_drop_strategy(
             scores=router_logits,
             topk_weights=topk_weights,
@@ -240,18 +241,8 @@ def _apply_token_drop_strategy(
                 global_topk_weights, topk_weights,
                 num_tokens_across_dp.numpy(), group=ep_group)
 
-            # # Also gather router_logits for non-local strategies that may need it
-            # if not isinstance(token_drop_strategy, ExpertDropLocalStrategy):
-            #     global_router_logits = torch.zeros(
-            #         (T_global, router_logits.shape[1]),
-            #         dtype=router_logits.dtype,
-            #         device=router_logits.device)
-            #     torch_npu.distributed.all_gather_into_tensor_uneven(
-            #         global_router_logits, router_logits,
-            #         num_tokens_across_dp.numpy(), group=ep_group)
-
     # Apply the strategy
-    result = token_drop_strategy.apply(
+    topk_weights, topk_ids = token_drop_strategy.apply(
         scores=scores,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
@@ -265,7 +256,7 @@ def _apply_token_drop_strategy(
         num_tokens_across_dp=num_tokens_across_dp,
     )
 
-    return result.topk_weights, result.topk_ids
+    return topk_weights, topk_ids
 
 
 def check_npu_moe_gating_top_k(
