@@ -835,9 +835,12 @@ class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
+
+        # all_gather_into_tensor_uneven requires contiguous input/output tensors.
+        topk_ids_contiguous = topk_ids.contiguous()
         torch_npu.distributed.all_gather_into_tensor_uneven(
             global_topk_ids_after_drop,
-            topk_ids,
+            topk_ids_contiguous,
             num_tokens_across_dp.numpy(),
             group=self.ep_group,
         )
