@@ -226,18 +226,26 @@ def renormalize_topk_weights(
 
 @dataclass
 class ExpandedDropStatistics:
-    """Statistics for expanded drop strategy.
+    """Statistics for expanded drop strategy (per-token normalized).
 
-    All weights are raw softmax probabilities (before renormalization).
+    All ratios are computed per-token first, then aggregated to distribution stats.
     """
-    # Drop severity
-    dropped_weight_ratio: float  # dropped_weight_sum / total_candidate_weight
-    max_dropped_weight: float  # max weight among dropped pairs
-    mean_dropped_weight: float  # mean weight among dropped pairs
+    # Per-token drop severity (distribution)
+    dropped_ratio_mean: float
+    dropped_ratio_std: float
+    dropped_ratio_p50: float
+    dropped_ratio_p90: float
+    dropped_ratio_p99: float
 
-    # Expanded expert value
-    expanded_weight_ratio: float  # expanded_kept_weight / original_topk_kept_weight
-    duplicate_suppression_count: int  # number of expanded positions suppressed
+    # Per-token expanded expert value (distribution)
+    expanded_ratio_mean: float
+    expanded_ratio_std: float
+    expanded_ratio_p50: float
+    expanded_ratio_p90: float
+    expanded_ratio_p99: float
+
+    # Global count
+    duplicate_suppression_count: int
 
 
 def compute_expanded_drop_statistics(
@@ -247,7 +255,7 @@ def compute_expanded_drop_statistics(
     top_k: int,
     duplicate_suppression_count: int,
 ) -> ExpandedDropStatistics:
-    """Compute statistics for expanded drop strategy.
+    """Compute statistics for expanded drop strategy (per-token normalized).
 
     Args:
         router_probs: Softmax probabilities [T, num_experts]
@@ -257,43 +265,70 @@ def compute_expanded_drop_statistics(
         duplicate_suppression_count: Count of suppressed expanded positions (tracked externally)
 
     Returns:
-        ExpandedDropStatistics with computed metrics
+        ExpandedDropStatistics with per-token normalized distribution stats
     """
     # Raw softmax probabilities for expanded candidate set (before renormalization)
     raw_weights = router_probs.gather(-1, expand_global_topk_ids)
 
-    # Drop severity metrics
+    # ========================================
+    # Per-token drop severity metrics
+    # ========================================
+
+    # Per-token candidate weight sum
+    token_candidate_weight = raw_weights.sum(dim=-1)  # [T]
+
+    # Per-token dropped weight
     dropped_mask = ~top_mask
     dropped_weights = raw_weights * dropped_mask.to(raw_weights.dtype)
-    dropped_weight_sum = dropped_weights.sum().item()
-    total_candidate_weight = raw_weights.sum().item()
-    dropped_weight_ratio = dropped_weight_sum / max(total_candidate_weight, 1e-10)
+    token_dropped_weight = dropped_weights.sum(dim=-1)  # [T]
 
-    dropped_weights_flat = dropped_weights[dropped_mask]
-    if dropped_weights_flat.numel() > 0:
-        max_dropped_weight = dropped_weights_flat.max().item()
-        mean_dropped_weight = dropped_weights_flat.mean().item()
-    else:
-        max_dropped_weight = 0.0
-        mean_dropped_weight = 0.0
+    # Per-token dropped ratio
+    per_token_dropped_ratio = token_dropped_weight / token_candidate_weight.clamp_min(1e-10)
 
-    # Expanded expert value metrics
+    # Compute distribution statistics (move to CPU for quantile computation)
+    ratios_cpu = per_token_dropped_ratio.cpu().float()
+    dropped_ratio_mean = ratios_cpu.mean().item()
+    dropped_ratio_std = ratios_cpu.std().item()
+    dropped_ratio_p50 = torch.quantile(ratios_cpu, 0.5).item()
+    dropped_ratio_p90 = torch.quantile(ratios_cpu, 0.9).item()
+    dropped_ratio_p99 = torch.quantile(ratios_cpu, 0.99).item()
+
+    # ========================================
+    # Per-token expanded expert value metrics
+    # ========================================
+
     expanded_topk = expand_global_topk_ids.shape[1]
-    expanded_kept_mask = top_mask[:, top_k:expanded_topk]  # expanded positions that are kept
-    original_kept_mask = top_mask[:, :top_k]  # original topk positions that are kept
 
-    expanded_kept_weight = (
-        raw_weights[:, top_k:expanded_topk] *
-        expanded_kept_mask.to(raw_weights.dtype)).sum().item()
-    original_kept_weight = (
-        raw_weights[:, :top_k] * original_kept_mask.to(raw_weights.dtype)).sum().item()
-    expanded_weight_ratio = expanded_kept_weight / max(original_kept_weight, 1e-10)
+    # Per-token kept weight sum
+    token_kept_weight = raw_weights * top_mask.to(raw_weights.dtype)
+    token_kept_sum = token_kept_weight.sum(dim=-1)  # [T]
+
+    # Per-token expanded kept weight
+    expanded_kept_weight = raw_weights[:, top_k:expanded_topk] * top_mask[:, top_k:expanded_topk].to(raw_weights.dtype)
+    token_expanded_kept = expanded_kept_weight.sum(dim=-1)  # [T]
+
+    # Per-token expanded ratio
+    per_token_expanded_ratio = token_expanded_kept / token_kept_sum.clamp_min(1e-10)
+
+    # Compute distribution statistics
+    expanded_ratios_cpu = per_token_expanded_ratio.cpu().float()
+    expanded_ratio_mean = expanded_ratios_cpu.mean().item()
+    expanded_ratio_std = expanded_ratios_cpu.std().item()
+    expanded_ratio_p50 = torch.quantile(expanded_ratios_cpu, 0.5).item()
+    expanded_ratio_p90 = torch.quantile(expanded_ratios_cpu, 0.9).item()
+    expanded_ratio_p99 = torch.quantile(expanded_ratios_cpu, 0.99).item()
 
     return ExpandedDropStatistics(
-        dropped_weight_ratio=dropped_weight_ratio,
-        max_dropped_weight=max_dropped_weight,
-        mean_dropped_weight=mean_dropped_weight,
-        expanded_weight_ratio=expanded_weight_ratio,
+        dropped_ratio_mean=dropped_ratio_mean,
+        dropped_ratio_std=dropped_ratio_std,
+        dropped_ratio_p50=dropped_ratio_p50,
+        dropped_ratio_p90=dropped_ratio_p90,
+        dropped_ratio_p99=dropped_ratio_p99,
+        expanded_ratio_mean=expanded_ratio_mean,
+        expanded_ratio_std=expanded_ratio_std,
+        expanded_ratio_p50=expanded_ratio_p50,
+        expanded_ratio_p90=expanded_ratio_p90,
+        expanded_ratio_p99=expanded_ratio_p99,
         duplicate_suppression_count=duplicate_suppression_count,
     )
 
@@ -309,7 +344,7 @@ def log_expanded_drop_statistics(
     Args:
         ep_rank: Current EP rank
         step: Current step number
-        stats: Computed expanded drop statistics
+        stats: Computed expanded drop statistics (per-token normalized)
         token_drop_csv_dir: Directory to write CSV files
     """
     if ep_rank != 0:
@@ -321,16 +356,26 @@ def log_expanded_drop_statistics(
 
     # Logger output
     logger.info(
-        "[ExpandedDrop][step=%d] Drop: ratio=%.2f%%, max=%.4f, mean=%.4f",
+        "[ExpandedDrop][step=%d] Drop: mean=%.2f%%, std=%.2f%%, p50=%.2f%%, p90=%.2f%%, p99=%.2f%%",
         step,
-        stats.dropped_weight_ratio * 100,
-        stats.max_dropped_weight,
-        stats.mean_dropped_weight,
+        stats.dropped_ratio_mean * 100,
+        stats.dropped_ratio_std * 100,
+        stats.dropped_ratio_p50 * 100,
+        stats.dropped_ratio_p90 * 100,
+        stats.dropped_ratio_p99 * 100,
     )
     logger.info(
-        "[ExpandedDrop][step=%d] Expanded: weight_ratio=%.2f%%, duplicate_suppressed=%d",
+        "[ExpandedDrop][step=%d] Expanded: mean=%.2f%%, std=%.2f%%, p50=%.2f%%, p90=%.2f%%, p99=%.2f%%",
         step,
-        stats.expanded_weight_ratio * 100,
+        stats.expanded_ratio_mean * 100,
+        stats.expanded_ratio_std * 100,
+        stats.expanded_ratio_p50 * 100,
+        stats.expanded_ratio_p90 * 100,
+        stats.expanded_ratio_p99 * 100,
+    )
+    logger.info(
+        "[ExpandedDrop][step=%d] Duplicate suppressed: %d",
+        step,
         stats.duplicate_suppression_count,
     )
 
@@ -349,18 +394,24 @@ def log_expanded_drop_statistics(
             if should_write_header:
                 writer.writerow([
                     "step",
-                    "dropped_weight_ratio",
-                    "max_dropped_weight",
-                    "mean_dropped_weight",
-                    "expanded_weight_ratio",
+                    "dropped_ratio_mean", "dropped_ratio_std",
+                    "dropped_ratio_p50", "dropped_ratio_p90", "dropped_ratio_p99",
+                    "expanded_ratio_mean", "expanded_ratio_std",
+                    "expanded_ratio_p50", "expanded_ratio_p90", "expanded_ratio_p99",
                     "duplicate_suppression_count",
                 ])
             writer.writerow([
                 step,
-                f"{stats.dropped_weight_ratio:.6f}",
-                f"{stats.max_dropped_weight:.6f}",
-                f"{stats.mean_dropped_weight:.6f}",
-                f"{stats.expanded_weight_ratio:.6f}",
+                f"{stats.dropped_ratio_mean:.6f}",
+                f"{stats.dropped_ratio_std:.6f}",
+                f"{stats.dropped_ratio_p50:.6f}",
+                f"{stats.dropped_ratio_p90:.6f}",
+                f"{stats.dropped_ratio_p99:.6f}",
+                f"{stats.expanded_ratio_mean:.6f}",
+                f"{stats.expanded_ratio_std:.6f}",
+                f"{stats.expanded_ratio_p50:.6f}",
+                f"{stats.expanded_ratio_p90:.6f}",
+                f"{stats.expanded_ratio_p99:.6f}",
                 stats.duplicate_suppression_count,
             ])
 
