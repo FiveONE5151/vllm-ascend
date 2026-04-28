@@ -18,6 +18,7 @@
 
 import csv
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -221,3 +222,149 @@ def renormalize_topk_weights(
         torch.zeros_like(topk_weights),
     )
     return normalized
+
+
+@dataclass
+class ExpandedDropStatistics:
+    """Statistics for expanded drop strategy.
+
+    All weights are raw softmax probabilities (before renormalization).
+    """
+    # Drop severity
+    dropped_weight_ratio: float  # dropped_weight_sum / total_candidate_weight
+    max_dropped_weight: float  # max weight among dropped pairs
+    mean_dropped_weight: float  # mean weight among dropped pairs
+
+    # Expanded expert value
+    expanded_weight_ratio: float  # expanded_kept_weight / original_topk_kept_weight
+    duplicate_suppression_count: int  # number of expanded positions suppressed
+
+
+def compute_expanded_drop_statistics(
+    router_probs: torch.Tensor,
+    expand_global_topk_ids: torch.Tensor,
+    top_mask: torch.Tensor,
+    top_k: int,
+    duplicate_suppression_count: int,
+) -> ExpandedDropStatistics:
+    """Compute statistics for expanded drop strategy.
+
+    Args:
+        router_probs: Softmax probabilities [T, num_experts]
+        expand_global_topk_ids: Expanded candidate expert IDs [T, topk + num_local_experts]
+        top_mask: Boolean mask for kept positions [T, expanded_topk]
+        top_k: Number of original topk experts
+        duplicate_suppression_count: Count of suppressed expanded positions (tracked externally)
+
+    Returns:
+        ExpandedDropStatistics with computed metrics
+    """
+    # Raw softmax probabilities for expanded candidate set (before renormalization)
+    raw_weights = router_probs.gather(-1, expand_global_topk_ids)
+
+    # Drop severity metrics
+    dropped_mask = ~top_mask
+    dropped_weights = raw_weights * dropped_mask.to(raw_weights.dtype)
+    dropped_weight_sum = dropped_weights.sum().item()
+    total_candidate_weight = raw_weights.sum().item()
+    dropped_weight_ratio = dropped_weight_sum / max(total_candidate_weight, 1e-10)
+
+    dropped_weights_flat = dropped_weights[dropped_mask]
+    if dropped_weights_flat.numel() > 0:
+        max_dropped_weight = dropped_weights_flat.max().item()
+        mean_dropped_weight = dropped_weights_flat.mean().item()
+    else:
+        max_dropped_weight = 0.0
+        mean_dropped_weight = 0.0
+
+    # Expanded expert value metrics
+    expanded_topk = expand_global_topk_ids.shape[1]
+    expanded_kept_mask = top_mask[:, top_k:expanded_topk]  # expanded positions that are kept
+    original_kept_mask = top_mask[:, :top_k]  # original topk positions that are kept
+
+    expanded_kept_weight = (
+        raw_weights[:, top_k:expanded_topk] *
+        expanded_kept_mask.to(raw_weights.dtype)).sum().item()
+    original_kept_weight = (
+        raw_weights[:, :top_k] * original_kept_mask.to(raw_weights.dtype)).sum().item()
+    expanded_weight_ratio = expanded_kept_weight / max(original_kept_weight, 1e-10)
+
+    return ExpandedDropStatistics(
+        dropped_weight_ratio=dropped_weight_ratio,
+        max_dropped_weight=max_dropped_weight,
+        mean_dropped_weight=mean_dropped_weight,
+        expanded_weight_ratio=expanded_weight_ratio,
+        duplicate_suppression_count=duplicate_suppression_count,
+    )
+
+
+def log_expanded_drop_statistics(
+    ep_rank: int,
+    step: int,
+    stats: ExpandedDropStatistics,
+    token_drop_csv_dir: str,
+) -> None:
+    """Log expanded drop statistics to logger and optionally CSV.
+
+    Args:
+        ep_rank: Current EP rank
+        step: Current step number
+        stats: Computed expanded drop statistics
+        token_drop_csv_dir: Directory to write CSV files
+    """
+    if ep_rank != 0:
+        return
+
+    ctx = get_forward_context()
+    if ctx.in_profile_run or ctx.capturing or ctx.is_graph_warmup:
+        return
+
+    # Logger output
+    logger.info(
+        "[ExpandedDrop][step=%d] Drop: ratio=%.2f%%, max=%.4f, mean=%.4f",
+        step,
+        stats.dropped_weight_ratio * 100,
+        stats.max_dropped_weight,
+        stats.mean_dropped_weight,
+    )
+    logger.info(
+        "[ExpandedDrop][step=%d] Expanded: weight_ratio=%.2f%%, duplicate_suppressed=%d",
+        step,
+        stats.expanded_weight_ratio * 100,
+        stats.duplicate_suppression_count,
+    )
+
+    # CSV output
+    if not token_drop_csv_dir:
+        return
+
+    try:
+        os.makedirs(token_drop_csv_dir, exist_ok=True)
+        csv_path = os.path.join(token_drop_csv_dir, "expanded_drop_stats.csv")
+        should_write_header = (not os.path.exists(csv_path) or
+                               os.path.getsize(csv_path) == 0)
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if should_write_header:
+                writer.writerow([
+                    "step",
+                    "dropped_weight_ratio",
+                    "max_dropped_weight",
+                    "mean_dropped_weight",
+                    "expanded_weight_ratio",
+                    "duplicate_suppression_count",
+                ])
+            writer.writerow([
+                step,
+                f"{stats.dropped_weight_ratio:.6f}",
+                f"{stats.max_dropped_weight:.6f}",
+                f"{stats.mean_dropped_weight:.6f}",
+                f"{stats.expanded_weight_ratio:.6f}",
+                stats.duplicate_suppression_count,
+            ])
+
+        logger.info("[ExpandedDrop][step=%d] CSV saved to: %s", step, csv_path)
+    except Exception as e:
+        logger.warning("[ExpandedDrop][step=%d] Failed to write CSV: %s", step,
+                       str(e))

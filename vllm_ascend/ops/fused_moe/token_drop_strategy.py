@@ -38,7 +38,9 @@ from vllm_ascend.ops.fused_moe.comm_utils import (
     gather_from_sequence_parallel_region,
 )
 from vllm_ascend.ops.fused_moe.token_drop_utils import (
+    compute_expanded_drop_statistics,
     compute_num_global_tokens_per_expert_after_drop,
+    log_expanded_drop_statistics,
     log_token_drop_statistics,
     rank_token_ranges,
     renormalize_topk_weights,
@@ -656,9 +658,22 @@ class ExpertExpandedDropStrategy(TokenDropStrategy):
         expanded_global_topk_weights = router_probs.gather(-1, expand_global_topk_ids)
 
         # Deduplicate: for expanded positions, check overlap with original topk
+        duplicate_suppression_count = 0
         for pos in range(self.top_k, expanded_topk):
             duplicate_mask = (expand_global_topk_ids[:, pos:pos+1] == expand_global_topk_ids[:, :pos]).any(dim=-1)
             top_mask[:, pos] = top_mask[:, pos] & ~duplicate_mask
+            duplicate_suppression_count += duplicate_mask.sum().item()
+
+        # Compute expanded drop statistics (using raw softmax probabilities)
+        expanded_drop_stats = None
+        if self.token_drop_logging:
+            expanded_drop_stats = compute_expanded_drop_statistics(
+                router_probs=router_probs,
+                expand_global_topk_ids=expand_global_topk_ids,
+                top_mask=top_mask,
+                top_k=self.top_k,
+                duplicate_suppression_count=duplicate_suppression_count,
+            )
 
         # Apply mask
         expanded_global_topk_weights = expanded_global_topk_weights * top_mask.to(
@@ -700,6 +715,15 @@ class ExpertExpandedDropStrategy(TokenDropStrategy):
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
             )
+
+            # Log expanded drop statistics
+            if expanded_drop_stats is not None:
+                log_expanded_drop_statistics(
+                    ep_rank=ep_rank,
+                    step=step,
+                    stats=expanded_drop_stats,
+                    token_drop_csv_dir=self.token_drop_csv_dir,
+                )
 
         return topk_weights_after_drop, topk_ids_after_drop
 
