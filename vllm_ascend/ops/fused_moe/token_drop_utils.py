@@ -299,16 +299,12 @@ def compute_expanded_drop_statistics(
 
     expanded_topk = expand_global_topk_ids.shape[1]
 
-    # Per-token kept weight sum
-    token_kept_weight = raw_weights * top_mask.to(raw_weights.dtype)
-    token_kept_sum = token_kept_weight.sum(dim=-1)  # [T]
-
-    # Per-token expanded kept weight
+    # Per-token expanded kept weight (using same denominator as dropped_ratio for consistency)
     expanded_kept_weight = raw_weights[:, top_k:expanded_topk] * top_mask[:, top_k:expanded_topk].to(raw_weights.dtype)
     token_expanded_kept = expanded_kept_weight.sum(dim=-1)  # [T]
 
-    # Per-token expanded ratio
-    per_token_expanded_ratio = token_expanded_kept / token_kept_sum.clamp_min(1e-10)
+    # Per-token expanded ratio (using token_candidate_weight as denominator for consistency)
+    per_token_expanded_ratio = token_expanded_kept / token_candidate_weight.clamp_min(1e-10)
 
     # Compute distribution statistics
     expanded_ratios_cpu = per_token_expanded_ratio.cpu().float()
