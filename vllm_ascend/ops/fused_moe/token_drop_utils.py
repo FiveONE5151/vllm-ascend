@@ -270,6 +270,16 @@ def compute_expanded_drop_statistics(
     # Raw softmax probabilities for expanded candidate set (before renormalization)
     raw_weights = router_probs.gather(-1, expand_global_topk_ids)
 
+    # Debug: Check for NaN in inputs
+    if torch.isnan(router_probs).any():
+        logger.warning("[ExpandedDrop] router_probs contains NaN values")
+    if torch.isnan(expand_global_topk_ids).any():
+        logger.warning("[ExpandedDrop] expand_global_topk_ids contains NaN values")
+    if torch.isnan(raw_weights).any():
+        nan_count = torch.isnan(raw_weights).sum().item()
+        total_count = raw_weights.numel()
+        logger.warning("[ExpandedDrop] raw_weights contains %d/%d NaN values", nan_count, total_count)
+
     # ========================================
     # Per-token drop severity metrics
     # ========================================
@@ -286,12 +296,23 @@ def compute_expanded_drop_statistics(
     per_token_dropped_ratio = token_dropped_weight / token_candidate_weight.clamp_min(1e-10)
 
     # Compute distribution statistics (move to CPU for quantile computation)
+    # Filter out NaN values for robust statistics
     ratios_cpu = per_token_dropped_ratio.cpu().float()
-    dropped_ratio_mean = ratios_cpu.mean().item()
-    dropped_ratio_std = ratios_cpu.std().item()
-    dropped_ratio_p50 = torch.quantile(ratios_cpu, 0.5).item()
-    dropped_ratio_p90 = torch.quantile(ratios_cpu, 0.9).item()
-    dropped_ratio_p99 = torch.quantile(ratios_cpu, 0.99).item()
+    valid_mask = ~torch.isnan(ratios_cpu) & ~torch.isinf(ratios_cpu)
+    valid_ratios = ratios_cpu[valid_mask]
+
+    if valid_ratios.numel() > 0:
+        dropped_ratio_mean = valid_ratios.mean().item()
+        dropped_ratio_std = valid_ratios.std().item() if valid_ratios.numel() > 1 else 0.0
+        dropped_ratio_p50 = torch.quantile(valid_ratios, 0.5).item()
+        dropped_ratio_p90 = torch.quantile(valid_ratios, 0.9).item()
+        dropped_ratio_p99 = torch.quantile(valid_ratios, 0.99).item()
+    else:
+        dropped_ratio_mean = float('nan')
+        dropped_ratio_std = float('nan')
+        dropped_ratio_p50 = float('nan')
+        dropped_ratio_p90 = float('nan')
+        dropped_ratio_p99 = float('nan')
 
     # ========================================
     # Per-token expanded expert value metrics
@@ -307,12 +328,23 @@ def compute_expanded_drop_statistics(
     per_token_expanded_ratio = token_expanded_kept / token_candidate_weight.clamp_min(1e-10)
 
     # Compute distribution statistics
+    # Filter out NaN values for robust statistics
     expanded_ratios_cpu = per_token_expanded_ratio.cpu().float()
-    expanded_ratio_mean = expanded_ratios_cpu.mean().item()
-    expanded_ratio_std = expanded_ratios_cpu.std().item()
-    expanded_ratio_p50 = torch.quantile(expanded_ratios_cpu, 0.5).item()
-    expanded_ratio_p90 = torch.quantile(expanded_ratios_cpu, 0.9).item()
-    expanded_ratio_p99 = torch.quantile(expanded_ratios_cpu, 0.99).item()
+    valid_expanded_mask = ~torch.isnan(expanded_ratios_cpu) & ~torch.isinf(expanded_ratios_cpu)
+    valid_expanded_ratios = expanded_ratios_cpu[valid_expanded_mask]
+
+    if valid_expanded_ratios.numel() > 0:
+        expanded_ratio_mean = valid_expanded_ratios.mean().item()
+        expanded_ratio_std = valid_expanded_ratios.std().item() if valid_expanded_ratios.numel() > 1 else 0.0
+        expanded_ratio_p50 = torch.quantile(valid_expanded_ratios, 0.5).item()
+        expanded_ratio_p90 = torch.quantile(valid_expanded_ratios, 0.9).item()
+        expanded_ratio_p99 = torch.quantile(valid_expanded_ratios, 0.99).item()
+    else:
+        expanded_ratio_mean = float('nan')
+        expanded_ratio_std = float('nan')
+        expanded_ratio_p50 = float('nan')
+        expanded_ratio_p90 = float('nan')
+        expanded_ratio_p99 = float('nan')
 
     return ExpandedDropStatistics(
         dropped_ratio_mean=dropped_ratio_mean,
