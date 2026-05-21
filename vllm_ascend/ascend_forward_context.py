@@ -251,12 +251,11 @@ def select_moe_comm_method(num_tokens: int,
     ).world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A2}:
-        if (num_tokens <= mc2_tokens_capacity
-                and vllm_config.parallel_config.world_size_across_dp /
-                vllm_config.parallel_config.pipeline_parallel_size >= 16):
+        # TODO: hack
+        if aclgraph_runtime_mode != CUDAGraphMode.NONE:
             moe_comm_type = MoECommType.MC2
         else:
-            moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_type = MoECommType.ALLTOALL
 
     elif soc_version in {AscendDeviceType.A3}:
         # ascend_config = get_ascend_config()
