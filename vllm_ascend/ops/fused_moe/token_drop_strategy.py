@@ -464,9 +464,7 @@ class ExpertDropLocalStrategy(TokenDropStrategy):
     ) -> TokenDropResult:
         topk = topk_weights.shape[1]
 
-        # Get token counts across DP for capacity calculation
-        num_tokens_across_dp_val = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
-        total_tokens = int(num_tokens_across_dp_val.sum().item())
+        total_tokens = topk_weights.shape[0]
 
         expert_capacity = math.ceil(total_tokens * topk * self.load_factor / num_experts)
         device_capacity = math.ceil(expert_capacity * num_local_experts)
