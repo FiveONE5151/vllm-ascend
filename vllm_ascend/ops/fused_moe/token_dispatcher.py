@@ -743,6 +743,8 @@ class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
         self.num_out_tokens = num_out_tokens_after_drop
 
         # Permute - includes all token-expert pairs (sentinel pairs grouped at end)
+        # 1. permuted tokens, by order of each dst rank's experts
+        # 2. mapping to restore original order (for combine)reversed_local_input_permutation_mapping[i] 表示：原始 token-major 序列中第 i 个 token-expert 对，在 permute 后的 expert-major 序列中的位置
         permutated_local_input_tokens, reversed_local_input_permutation_mapping = \
             torch_npu.npu_moe_token_permute(
                 tokens=hidden_states,
@@ -772,6 +774,8 @@ class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Postprocess - local expert grouping
+        # 1. permuted by local expert order for computation
+        # 2. mapping from local expert grouped order to global token order (for combine)
         global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = \
             self._dispatch_postprocess(
                 global_input_tokens,
@@ -870,6 +874,7 @@ class TokenDispatcherWithAll2AllvUnified(TokenDispatcherWithAll2AllV):
         num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
 
         # Compute global_input_tokens_local_experts_indices
+        # [num_received_tokens,] local expert id for each received token, used for post-all2all local grouping
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
