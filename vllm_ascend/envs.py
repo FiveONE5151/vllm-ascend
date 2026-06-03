@@ -154,6 +154,19 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_TOKEN_DROP_LOCAL_ONLY", '0'))),
 
     ### [yiwu] end token drop related envs
+
+    ### [yiwu] router logits capture related envs
+    "VLLM_ROUTER_LOGITS_CAPTURE":
+    lambda: bool(int(os.getenv("VLLM_ROUTER_LOGITS_CAPTURE", '0'))),
+
+    "VLLM_ROUTER_LOGITS_CAPTURE_DIR":
+    lambda: os.getenv("VLLM_ROUTER_LOGITS_CAPTURE_DIR", "router_logits"),
+
+    "VLLM_ROUTER_LOGITS_CAPTURE_ONLY_ALLGATHER":
+    lambda: bool(int(os.getenv("VLLM_ROUTER_LOGITS_CAPTURE_ONLY_ALLGATHER",
+                               '1'))),
+
+    ### [yiwu] end router logits capture related envs
 }
 
 # end-env-vars-definition

@@ -177,6 +177,21 @@ def _is_global_rank0() -> bool:
     return True
 
 
+def _should_capture_router_logits(forward_context) -> bool:
+    if not envs.VLLM_ROUTER_LOGITS_CAPTURE:
+        return False
+    if not _is_global_rank0():
+        return False
+    if (forward_context.in_profile_run or forward_context.capturing
+            or forward_context.is_graph_warmup):
+        return False
+    if (envs.VLLM_ROUTER_LOGITS_CAPTURE_ONLY_ALLGATHER
+            and not isinstance(forward_context.moe_comm_method,
+                               AllGatherCommImpl)):
+        return False
+    return True
+
+
 def _append_token_drop_csv(rows) -> None:
     if not rows:
         return
@@ -331,6 +346,7 @@ class AscendFusedMoE(FusedMoE):
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
+        self.router_logits_capture_step = 0
 
         self._expert_map = None
         self.log2phy = None
@@ -456,6 +472,139 @@ class AscendFusedMoE(FusedMoE):
         return torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(
             final_hidden_states)
 
+    def _get_num_tokens_across_ranks(
+            self, forward_context, local_num_tokens: int,
+            global_num_tokens: int) -> Optional[torch.Tensor]:
+        try:
+            num_tokens = forward_context.dp_metadata.num_tokens_across_dp_cpu
+        except AssertionError:
+            num_tokens = torch.full((self.ep_size, ),
+                                    local_num_tokens,
+                                    dtype=torch.int64,
+                                    device=torch.device("cpu"))
+        except AttributeError:
+            num_tokens = torch.full((self.ep_size, ),
+                                    local_num_tokens,
+                                    dtype=torch.int64,
+                                    device=torch.device("cpu"))
+
+        num_tokens = num_tokens.to(torch.int64).cpu()
+        if int(num_tokens.sum().item()) != global_num_tokens:
+            logger.warning(
+                "[RouterLogitsCapture] Skip layer %s step %d because "
+                "num_tokens_across_ranks sum %d != router_logits tokens %d",
+                self.layer_name, self.router_logits_capture_step,
+                int(num_tokens.sum().item()), global_num_tokens)
+            return None
+        return num_tokens
+
+    @staticmethod
+    def _build_token_source_ranks(
+            num_tokens_across_ranks: torch.Tensor) -> torch.Tensor:
+        return torch.repeat_interleave(
+            torch.arange(num_tokens_across_ranks.numel(), dtype=torch.int32),
+            num_tokens_across_ranks.to(torch.int64))
+
+    def _get_expert_physical_ranks(
+            self, num_router_experts: int) -> Optional[torch.Tensor]:
+        if self.global_expert_map is not None:
+            global_expert_map = self.global_expert_map.cpu()
+            if global_expert_map.shape[1] < num_router_experts:
+                logger.warning(
+                    "[RouterLogitsCapture] Skip layer %s step %d because "
+                    "global_expert_map experts %d < router logits experts %d",
+                    self.layer_name, self.router_logits_capture_step,
+                    global_expert_map.shape[1], num_router_experts)
+                return None
+            expert_ranks = torch.full((num_router_experts, ),
+                                      -1,
+                                      dtype=torch.int32)
+            if self.log2phy is not None:
+                log2phy = self.log2phy.cpu().to(torch.int64)
+                valid_count = int((global_expert_map[0] != -1).sum().item())
+                if valid_count <= 0:
+                    return None
+                for expert_id in range(min(num_router_experts,
+                                           log2phy.numel())):
+                    physical_expert_id = int(log2phy[expert_id].item())
+                    physical_rank = physical_expert_id // valid_count
+                    if physical_rank < 0 or physical_rank >= self.ep_size:
+                        return None
+                    expert_ranks[expert_id] = physical_rank
+            else:
+                for expert_id in range(num_router_experts):
+                    ranks = torch.nonzero(global_expert_map[:, expert_id] != -1,
+                                          as_tuple=False).flatten()
+                    if ranks.numel() > 0:
+                        expert_ranks[expert_id] = int(ranks[0].item())
+        else:
+            if self.local_num_experts <= 0:
+                return None
+            expert_ranks = torch.arange(num_router_experts,
+                                        dtype=torch.int32) // int(
+                                            self.local_num_experts)
+
+        if expert_ranks.numel() != num_router_experts or (expert_ranks < 0).any():
+            logger.warning(
+                "[RouterLogitsCapture] Skip layer %s step %d because "
+                "expert physical ranks cannot be inferred reliably",
+                self.layer_name, self.router_logits_capture_step)
+            return None
+        return expert_ranks
+
+    @staticmethod
+    def _get_max_num_seqs() -> int:
+        vllm_config = get_current_vllm_config()
+        return int(getattr(vllm_config.scheduler_config, "max_num_seqs", -1))
+
+    def _save_router_logits(self, router_logits: torch.Tensor,
+                            forward_context,
+                            local_num_tokens: int) -> None:
+        if router_logits is None:
+            return
+
+        num_tokens_across_ranks = self._get_num_tokens_across_ranks(
+            forward_context, local_num_tokens, router_logits.shape[0])
+        if num_tokens_across_ranks is None:
+            return
+
+        token_source_ranks = self._build_token_source_ranks(
+            num_tokens_across_ranks)
+        expert_physical_ranks = self._get_expert_physical_ranks(
+            router_logits.shape[1])
+        if expert_physical_ranks is None:
+            return
+
+        capture_dir = envs.VLLM_ROUTER_LOGITS_CAPTURE_DIR
+        os.makedirs(capture_dir, exist_ok=True)
+
+        safe_layer_name = self.layer_name.replace(os.sep, "_").replace(
+            ".", "_")
+        file_name = (
+            f"router_logits_layer_{self.moe_instance_id}_"
+            f"step_{self.router_logits_capture_step}_{safe_layer_name}.pt")
+        save_path = os.path.join(capture_dir, file_name)
+
+        payload = {
+            "moe_instance_id": self.moe_instance_id,
+            "layer_name": self.layer_name,
+            "step": self.router_logits_capture_step,
+            "rank": 0,
+            "shape": tuple(router_logits.shape),
+            "dtype": str(router_logits.dtype),
+            "router_logits": router_logits.detach().to("cpu").contiguous(),
+            "token_source_ranks": token_source_ranks.contiguous(),
+            "num_tokens_across_ranks": num_tokens_across_ranks.contiguous(),
+            "expert_physical_ranks": expert_physical_ranks.contiguous(),
+            "expert_rank_semantics": "physical",
+            "max_num_seqs": self._get_max_num_seqs(),
+            "ep_size": self.ep_size,
+            "num_local_experts": self.local_num_experts,
+            "global_num_experts": self.global_num_experts,
+        }
+        torch.save(payload, save_path)
+        self.router_logits_capture_step += 1
+
     def forward_impl(  # type: ignore[override]
             self,
             hidden_states: torch.Tensor,
@@ -517,12 +666,23 @@ class AscendFusedMoE(FusedMoE):
                 set_flash_common3_context(topk_weights=topk_weights,
                                           topk_ids=topk_ids)
 
+        local_num_tokens = hidden_states.shape[:-1].numel()
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type)
+
+        if _should_capture_router_logits(forward_context):
+            try:
+                self._save_router_logits(router_logits, forward_context,
+                                         local_num_tokens)
+            except Exception as e:
+                logger.warning(
+                    "[RouterLogitsCapture] Failed to save router logits for "
+                    "layer %s at step %d: %s", self.layer_name,
+                    self.router_logits_capture_step, str(e))
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
