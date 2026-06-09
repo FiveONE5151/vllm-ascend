@@ -255,10 +255,10 @@ def select_moe_comm_method(num_tokens: int,
                 and vllm_config.parallel_config.world_size_across_dp /
                 vllm_config.parallel_config.pipeline_parallel_size >= 16):
             moe_comm_type = MoECommType.MC2
-            logger.info(f"Using MC2 for MoE communication since num_tokens ({num_tokens}) <= mc2_tokens_capacity ({mc2_tokens_capacity}) and DP size is large enough.")
+            # logger.info(f"Using MC2 for MoE communication since num_tokens ({num_tokens}) <= mc2_tokens_capacity ({mc2_tokens_capacity}) and DP size is large enough.")
         else:
             moe_comm_type = MoECommType.ALLGATHER
-            logger.info(f"Using all-gather for MoE communication since num_tokens ({num_tokens}) > mc2_tokens_capacity ({mc2_tokens_capacity}) or DP size is not large enough.")
+            # logger.info(f"Using all-gather for MoE communication since num_tokens ({num_tokens}) > mc2_tokens_capacity ({mc2_tokens_capacity}) or DP size is not large enough.")
 
     elif soc_version in {AscendDeviceType.A3}:
         # ascend_config = get_ascend_config()
