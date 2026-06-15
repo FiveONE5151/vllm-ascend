@@ -40,7 +40,9 @@ def set_ascend_forward_context(
         is_draft_model=False,
         is_multimodal_model=False,
         is_graph_warmup=False,
-        is_graph_capturing=False,):
+        is_graph_capturing=False,
+        uniform_decode=False,
+):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
@@ -74,6 +76,9 @@ def set_ascend_forward_context(
         # [yiwu] NOTE: set my_capturing, dont intefere with capturing
         forward_context.my_capturing = is_graph_capturing
         forward_context.is_graph_warmup = is_graph_warmup
+
+        # [yiwu] NOTE: set uniform_decode into forward_context, to control the behavior of some ops in decode stage.
+        forward_context.uniform_decode = uniform_decode
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
