@@ -47,6 +47,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (AllGatherCommImpl,
 from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
 from vllm_ascend.ops.fused_moe.token_drop_strategy import (
     TokenDropStrategy, create_token_drop_strategy)
+from vllm_ascend.ops.fused_moe.topology_routing import (
+    validate_topology_routing_runtime)
 from vllm_ascend.quantization.w4a8_dynamic import \
     AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.w8a8_dynamic import \
@@ -294,7 +296,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_local_experts=num_local_experts,
             ep_rank=ep_rank,
             ep_size=ep_size,
-            ep_group=ep_group)
+            ep_group=ep_group,
+            moe_instance_id=getattr(layer, "moe_instance_id", None),
+            layer_name=getattr(layer, "layer_name", None))
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -368,6 +372,8 @@ class AscendFusedMoE(FusedMoE):
         ascend_config = get_ascend_config()
         # flashcommon3 gate stream
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
+        validate_topology_routing_runtime(
+            multistream_overlap_gate=self.multistream_overlap_gate)
         if self.multistream_overlap_gate and AscendFusedMoE.gate_stream is None:
             AscendFusedMoE.gate_stream = torch.npu.Stream()
         if self.custom_routing_function is None and self.e_score_correction_bias is not None:
@@ -654,7 +660,9 @@ class AscendFusedMoE(FusedMoE):
                     num_local_experts=self.local_num_experts,
                     ep_rank=self.ep_rank,
                     ep_size=self.ep_size,
-                    ep_group=get_ep_group().device_group)
+                    ep_group=get_ep_group().device_group,
+                    moe_instance_id=self.moe_instance_id,
+                    layer_name=self.layer_name)
 
                 if isinstance(forward_context.moe_comm_method,
                               AllGatherCommImpl):

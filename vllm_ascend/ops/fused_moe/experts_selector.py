@@ -21,6 +21,7 @@ import torch_npu.distributed
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ops.fused_moe.topology_routing import apply_topology_aware_routing
 from vllm_ascend.utils import get_weight_prefetch_method
 
 if TYPE_CHECKING:
@@ -48,7 +49,9 @@ def select_experts(hidden_states: torch.Tensor,
                    num_local_experts: int = 0,
                    ep_rank: int = 0,
                    ep_size: int = 1,
-                   ep_group=None):
+                   ep_group=None,
+                   moe_instance_id: Optional[int] = None,
+                   layer_name: Optional[str] = None):
     """
     Fused experts with select experts.
 
@@ -117,8 +120,24 @@ def select_experts(hidden_states: torch.Tensor,
             global_num_experts=global_num_experts,
         )
 
-    # Apply token drop strategy if provided
     ctx = get_forward_context()
+    topk_weights, topk_ids = apply_topology_aware_routing(
+        router_logits=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=top_k,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+        global_num_experts=global_num_experts,
+        num_local_experts=num_local_experts,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        ep_group=ep_group if ep_group is not None else get_ep_group().device_group,
+        moe_instance_id=moe_instance_id,
+        layer_name=layer_name,
+    )
+
+    # Apply token drop strategy if provided
     if token_drop_strategy is not None and ctx.moe_comm_type == MoECommType.ALLTOALL:
         topk_weights, topk_ids = _apply_token_drop_strategy(
             scores=router_logits,

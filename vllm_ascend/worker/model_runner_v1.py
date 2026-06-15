@@ -1564,7 +1564,7 @@ class NPUModelRunner(GPUModelRunner):
                     total_num_scheduled_tokens,
                     model_instance=self.model,
                     is_multimodal_model=self.is_multimodal_model,
-                    unifrom_decode = uniform_decode):
+                    uniform_decode=uniform_decode):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(

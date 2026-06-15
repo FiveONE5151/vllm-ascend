@@ -155,6 +155,33 @@ env_variables: Dict[str, Callable[[], Any]] = {
 
     ### [yiwu] end token drop related envs
 
+    ### [yiwu] topology-aware routing related envs
+    "VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING":
+    lambda: bool(int(os.getenv("VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING", '0'))),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY":
+    lambda: os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY", "greedy_token"),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY":
+    lambda: bool(
+        int(os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY", '1'))),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING":
+    lambda: bool(
+        int(os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING", '0'))),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR":
+    lambda: os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR",
+                      "topology_routing"),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG":
+    lambda: os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG", ""),
+
+    "VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON":
+    lambda: os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON", ""),
+
+    ### [yiwu] end topology-aware routing related envs
+
     ### [yiwu] router logits capture related envs
     "VLLM_ROUTER_LOGITS_CAPTURE":
     lambda: bool(int(os.getenv("VLLM_ROUTER_LOGITS_CAPTURE", '0'))),

@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Optional
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -221,7 +222,13 @@ class AscendW4A16FusedMoEMethod:
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
+            global_num_experts=global_num_experts,
+            num_local_experts=getattr(layer, "local_num_experts", 0),
+            ep_rank=getattr(layer, "ep_rank", 0),
+            ep_size=getattr(layer, "ep_size", 1),
+            ep_group=get_ep_group().device_group,
+            moe_instance_id=getattr(layer, "moe_instance_id", None),
+            layer_name=getattr(layer, "layer_name", None))
 
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)

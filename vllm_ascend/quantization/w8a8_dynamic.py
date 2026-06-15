@@ -221,7 +221,13 @@ class AscendW8A8DynamicFusedMoEMethod:
                 mix_placement=layer.mix_placement,
                 num_logical_experts=router_logits.shape[1],
                 num_shared_experts=n_shared_experts,
-                global_num_experts=global_num_experts)
+                global_num_experts=global_num_experts,
+                num_local_experts=getattr(layer, "local_num_experts", 0),
+                ep_rank=getattr(layer, "ep_rank", 0),
+                ep_size=getattr(layer, "ep_size", 1),
+                ep_group=get_ep_group().device_group,
+                moe_instance_id=getattr(layer, "moe_instance_id", None),
+                layer_name=getattr(layer, "layer_name", None))
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:

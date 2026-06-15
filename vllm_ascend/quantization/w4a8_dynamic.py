@@ -359,7 +359,13 @@ class AscendW4A8DynamicFusedMoEMethod:
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
+            global_num_experts=global_num_experts,
+            num_local_experts=getattr(layer, "local_num_experts", 0),
+            ep_rank=getattr(layer, "ep_rank", 0),
+            ep_size=getattr(layer, "ep_size", 1),
+            ep_group=get_ep_group().device_group,
+            moe_instance_id=getattr(layer, "moe_instance_id", None),
+            layer_name=getattr(layer, "layer_name", None))
 
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
