@@ -31,6 +31,7 @@ from vllm_ascend.ascend_forward_context import MoECommType
 _STEP_BY_LAYER: dict[tuple[int, str], int] = {}
 _TOPOLOGY_CONFIG_CACHE: tuple[str, Any | None] | None = None
 _SOLVER_CONFIG_CACHE: tuple[str, Any | None] | None = None
+_TOKEN_TOPOLOGY_CONFIG_CACHE: tuple[str, Any | None] | None = None
 
 
 def topology_aware_routing_enabled() -> bool:
@@ -112,8 +113,15 @@ def apply_topology_aware_routing(
         rank_start, rank_end = _rank_range(global_token_counts, ep_rank)
 
     topology_config = _load_topology_config()
+    token_topology_config = _load_token_topology_config()
     solver_config = _load_solver_config(topology_config)
-    token_source_ranks = _build_token_source_ranks(global_token_counts)
+    solver_ep_size = _resolve_solver_ep_size(topology_config, ep_size)
+    token_source_ranks, token_source_rank_mapping = _build_token_source_ranks_for_routing(
+        router_logits=global_router_logits,
+        ep_size=solver_ep_size,
+        token_counts=global_token_counts,
+        token_topology_config=token_topology_config,
+    )
     expert_physical_ranks = _expert_physical_ranks(num_experts, local_experts,
                                                    topology_config,
                                                    router_logits.device)
@@ -144,6 +152,8 @@ def apply_topology_aware_routing(
             before_topk_ids=global_topk_ids_before,
             after_topk_ids=routed_ids,
             token_counts=global_token_counts,
+            token_source_ranks=token_source_ranks,
+            token_source_rank_mapping=token_source_rank_mapping,
             expert_physical_ranks=expert_physical_ranks,
             top_k=top_k,
             num_experts=num_experts,
@@ -153,6 +163,7 @@ def apply_topology_aware_routing(
             comm_type=comm_type,
             route_method=route_method,
             topology_config=topology_config,
+            token_topology_config=token_topology_config,
             solver_config=solver_config,
         )
 
@@ -190,6 +201,24 @@ def _load_topology_config():
     return config
 
 
+def _load_token_topology_config():
+    global _TOKEN_TOPOLOGY_CONFIG_CACHE
+    config_path = envs.VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG
+    if _TOKEN_TOPOLOGY_CONFIG_CACHE is not None and _TOKEN_TOPOLOGY_CONFIG_CACHE[0] == config_path:
+        return _TOKEN_TOPOLOGY_CONFIG_CACHE[1]
+    if not config_path:
+        _TOKEN_TOPOLOGY_CONFIG_CACHE = (config_path, None)
+        return None
+    try:
+        from topology_aware_routing import load_token_topology_config
+    except ModuleNotFoundError:
+        _load_route_function()
+        from topology_aware_routing import load_token_topology_config
+    config = load_token_topology_config(config_path)
+    _TOKEN_TOPOLOGY_CONFIG_CACHE = (config_path, config)
+    return config
+
+
 def _load_solver_config(topology_config):
     global _SOLVER_CONFIG_CACHE
     raw = envs.VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON
@@ -206,6 +235,55 @@ def _load_solver_config(topology_config):
         config = None
     _SOLVER_CONFIG_CACHE = (raw, config)
     return config
+
+
+def _resolve_solver_ep_size(topology_config, runtime_ep_size: int) -> int:
+    if topology_config is None:
+        return int(runtime_ep_size)
+
+    rank_to_node = getattr(topology_config, "rank_to_node", None)
+    if rank_to_node is not None and int(rank_to_node.numel()) > 0:
+        return int(rank_to_node.numel())
+
+    expert_physical_ranks = getattr(topology_config, "expert_physical_ranks", None)
+    if expert_physical_ranks is not None and int(expert_physical_ranks.numel()) > 0:
+        return int(expert_physical_ranks.max().item()) + 1
+
+    return int(runtime_ep_size)
+
+
+def _build_token_source_ranks_for_routing(
+    *,
+    router_logits: torch.Tensor,
+    ep_size: int,
+    token_counts: torch.Tensor,
+    token_topology_config,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if token_topology_config is None:
+        return _build_token_source_ranks(token_counts), {
+            "mode": "capture",
+            "ep_size": int(token_counts.numel()),
+        }
+
+    try:
+        from topology_aware_routing import build_token_source_ranks_from_config
+    except ModuleNotFoundError:
+        _load_route_function()
+        from topology_aware_routing import build_token_source_ranks_from_config
+
+    token_source_ranks = build_token_source_ranks_from_config(
+        num_tokens=int(router_logits.shape[0]),
+        ep_size=ep_size,
+        token_topology_config=token_topology_config,
+        device=router_logits.device,
+    )
+    return token_source_ranks, {
+        "mode": token_topology_config.token_source_policy,
+        "name": token_topology_config.name,
+        "remainder_policy": token_topology_config.remainder_policy,
+        "order": token_topology_config.order,
+        "ep_size": int(ep_size),
+    }
 
 
 def _num_router_experts(router_logits: torch.Tensor,
@@ -331,6 +409,8 @@ def _save_routing_log(
     before_topk_ids: torch.Tensor,
     after_topk_ids: torch.Tensor,
     token_counts: torch.Tensor,
+    token_source_ranks: torch.Tensor,
+    token_source_rank_mapping: dict[str, Any],
     expert_physical_ranks: torch.Tensor,
     top_k: int,
     num_experts: int,
@@ -340,6 +420,7 @@ def _save_routing_log(
     comm_type: Optional[MoECommType],
     route_method: str,
     topology_config,
+    token_topology_config,
     solver_config,
 ) -> None:
     if not _is_global_rank0():
@@ -352,7 +433,6 @@ def _save_routing_log(
     safe_layer = _safe_layer_name(layer)
     file_name = f"router_logits_layer_{instance_id}_step_{step}_{safe_layer}.pt"
 
-    token_source_ranks = _build_token_source_ranks(token_counts)
     common_metadata = {
         "moe_instance_id": instance_id,
         "layer_name": layer,
@@ -364,6 +444,8 @@ def _save_routing_log(
         "moe_comm_type": comm_type.name if comm_type is not None else None,
         "uniform_decode": bool(getattr(get_forward_context(), "uniform_decode", False)),
         "topology_config": envs.VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG or None,
+        "token_topology_config": envs.VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG or None,
+        "token_source_rank_mapping": token_source_rank_mapping,
         "solver_config": solver_config,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -375,6 +457,7 @@ def _save_routing_log(
         "router_logits": router_logits.detach().cpu().contiguous(),
         "token_source_ranks": token_source_ranks.to(torch.int32).contiguous(),
         "num_tokens_across_ranks": token_counts.detach().cpu().contiguous(),
+        "actual_token_counts": token_counts.detach().cpu().to(torch.int32).contiguous(),
         "expert_physical_ranks": expert_physical_ranks.detach().cpu().to(torch.int32).contiguous(),
         "expert_rank_semantics": "physical",
         "ep_size": int(token_counts.numel()),
