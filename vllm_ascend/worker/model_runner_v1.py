@@ -2302,7 +2302,8 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     is_multimodal_model=self.is_multimodal_model,
                     is_graph_warmup=is_graph_warmup,
-                    is_graph_capturing=is_graph_capturing,):
+                    is_graph_capturing=is_graph_capturing,
+                    uniform_decode=uniform_decode,):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
                     intermediate_tensors, inputs_embeds)
