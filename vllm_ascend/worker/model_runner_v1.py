@@ -115,7 +115,8 @@ from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType, get_mc2_tokens_capacity, select_moe_comm_method,
-    set_ascend_forward_context, set_mc2_mask, set_mc2_tokens_capacity)
+    set_ascend_forward_context, set_mc2_mask, set_mc2_tokens_capacity,
+    set_tar_valid_token_mask)
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -291,6 +292,7 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs,
                                 self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
+        set_tar_valid_token_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (
             self.speculative_config.num_speculative_tokens
             if self.speculative_config else 0)
@@ -2103,6 +2105,15 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = hidden_states
         return hidden_states
 
+    def _prepare_topology_routing_states_for_graph(self,
+                                                   max_local_tokens: int) -> None:
+        if not is_moe_model(self.vllm_config):
+            return
+        for module in self.model.modules():
+            state = getattr(module, "topology_routing_state", None)
+            if state is not None:
+                state.prepare_for_tokens(max_local_tokens)
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2201,6 +2212,9 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
+
+        if is_graph_capturing and envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+            self._prepare_topology_routing_states_for_graph(num_tokens_padded)
 
         # filter out the valid batch descriptor
         if cudagraph_runtime_mode is not None:

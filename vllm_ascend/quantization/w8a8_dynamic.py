@@ -227,7 +227,8 @@ class AscendW8A8DynamicFusedMoEMethod:
                 ep_size=getattr(layer, "ep_size", 1),
                 ep_group=get_ep_group().device_group,
                 moe_instance_id=getattr(layer, "moe_instance_id", None),
-                layer_name=getattr(layer, "layer_name", None))
+                layer_name=getattr(layer, "layer_name", None),
+                topology_routing_state=getattr(layer, "topology_routing_state", None))
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:

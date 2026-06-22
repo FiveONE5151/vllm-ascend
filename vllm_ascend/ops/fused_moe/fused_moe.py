@@ -48,7 +48,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
 from vllm_ascend.ops.fused_moe.token_drop_strategy import (
     TokenDropStrategy, create_token_drop_strategy)
 from vllm_ascend.ops.fused_moe.topology_routing import (
-    validate_topology_routing_runtime)
+    TopologyRoutingState, validate_topology_routing_runtime)
 from vllm_ascend.quantization.w4a8_dynamic import \
     AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.w8a8_dynamic import \
@@ -298,7 +298,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             ep_size=ep_size,
             ep_group=ep_group,
             moe_instance_id=getattr(layer, "moe_instance_id", None),
-            layer_name=getattr(layer, "layer_name", None))
+            layer_name=getattr(layer, "layer_name", None),
+            topology_routing_state=getattr(layer, "topology_routing_state", None))
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -428,6 +429,10 @@ class AscendFusedMoE(FusedMoE):
 
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
+
+        self.topology_routing_state: Optional[TopologyRoutingState] = (
+            TopologyRoutingState.from_layer(self)
+            if envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING else None)
 
         # Create token drop strategy if enabled
         self.token_drop_strategy: Optional[TokenDropStrategy] = None
@@ -662,7 +667,8 @@ class AscendFusedMoE(FusedMoE):
                     ep_size=self.ep_size,
                     ep_group=get_ep_group().device_group,
                     moe_instance_id=self.moe_instance_id,
-                    layer_name=self.layer_name)
+                    layer_name=self.layer_name,
+                    topology_routing_state=self.topology_routing_state)
 
                 if isinstance(forward_context.moe_comm_method,
                               AllGatherCommImpl):

@@ -27,6 +27,7 @@ from vllm_ascend.utils import get_weight_prefetch_method
 if TYPE_CHECKING:
     from vllm_ascend.ops.fused_moe.token_drop_strategy import (
         ExpertDropLocalStrategy, TokenDropStrategy)
+    from vllm_ascend.ops.fused_moe.topology_routing import TopologyRoutingState
 
 
 def select_experts(hidden_states: torch.Tensor,
@@ -51,7 +52,8 @@ def select_experts(hidden_states: torch.Tensor,
                    ep_size: int = 1,
                    ep_group=None,
                    moe_instance_id: Optional[int] = None,
-                   layer_name: Optional[str] = None):
+                   layer_name: Optional[str] = None,
+                   topology_routing_state: Optional["TopologyRoutingState"] = None):
     """
     Fused experts with select experts.
 
@@ -135,6 +137,7 @@ def select_experts(hidden_states: torch.Tensor,
         ep_group=ep_group if ep_group is not None else get_ep_group().device_group,
         moe_instance_id=moe_instance_id,
         layer_name=layer_name,
+        topology_routing_state=topology_routing_state,
     )
 
     # Apply token drop strategy if provided

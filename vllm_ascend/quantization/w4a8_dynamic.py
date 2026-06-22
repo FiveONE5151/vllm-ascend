@@ -365,7 +365,8 @@ class AscendW4A8DynamicFusedMoEMethod:
             ep_size=getattr(layer, "ep_size", 1),
             ep_group=get_ep_group().device_group,
             moe_instance_id=getattr(layer, "moe_instance_id", None),
-            layer_name=getattr(layer, "layer_name", None))
+            layer_name=getattr(layer, "layer_name", None),
+            topology_routing_state=getattr(layer, "topology_routing_state", None))
 
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.

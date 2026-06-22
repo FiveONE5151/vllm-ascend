@@ -169,6 +169,17 @@ def set_ascend_forward_context(
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
 
+            reserved_tar_mask = get_tar_valid_token_mask()
+            if reserved_tar_mask is not None:
+                if int(reserved_tar_mask.shape[0]) < int(num_tokens):
+                    tar_mask = torch.zeros(num_tokens, dtype=torch.bool,
+                                           device=reserved_tar_mask.device)
+                else:
+                    tar_mask = reserved_tar_mask[:num_tokens]
+                tar_mask[:num_actual_tokens] = True
+                tar_mask[num_actual_tokens:] = False
+                forward_context.tar_valid_token_mask = tar_mask
+
         try:
             yield
         finally:
@@ -177,6 +188,7 @@ def set_ascend_forward_context(
 
 _mc2_tokens_capacity: Optional[int] = None
 _reserved_mc2_mask: Optional[torch.Tensor] = None
+_reserved_tar_valid_token_mask: Optional[torch.Tensor] = None
 _sin: Optional[torch.Tensor] = None
 _cos: Optional[torch.Tensor] = None
 
@@ -215,6 +227,28 @@ def set_mc2_mask(vllm_config, device):
 
 def get_mc2_mask():
     return _reserved_mc2_mask
+
+
+
+def set_tar_valid_token_mask(vllm_config, device):
+    global _reserved_tar_valid_token_mask
+    if _reserved_tar_valid_token_mask is not None:
+        return
+    if not (is_moe_model(vllm_config)
+            and envs_ascend.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING):
+        _reserved_tar_valid_token_mask = None
+        return
+    if vllm_config.compilation_config.cudagraph_capture_sizes:
+        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
+    else:
+        max_num_tokens = get_mc2_tokens_capacity()
+    _reserved_tar_valid_token_mask = torch.zeros(max_num_tokens,
+                                                 dtype=torch.bool,
+                                                 device=device)
+
+
+def get_tar_valid_token_mask():
+    return _reserved_tar_valid_token_mask
 
 
 def select_moe_comm_method(num_tokens: int,

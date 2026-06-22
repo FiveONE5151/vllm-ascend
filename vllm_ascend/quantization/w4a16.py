@@ -228,7 +228,8 @@ class AscendW4A16FusedMoEMethod:
             ep_size=getattr(layer, "ep_size", 1),
             ep_group=get_ep_group().device_group,
             moe_instance_id=getattr(layer, "moe_instance_id", None),
-            layer_name=getattr(layer, "layer_name", None))
+            layer_name=getattr(layer, "layer_name", None),
+            topology_routing_state=getattr(layer, "topology_routing_state", None))
 
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
