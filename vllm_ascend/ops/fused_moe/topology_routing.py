@@ -237,6 +237,7 @@ def apply_topology_aware_routing(
                       getattr(ctx, "capturing", False) or
                       runtime_mode_name != "NONE")
     local_valid_mask = getattr(ctx, "tar_valid_token_mask", None)
+    comm_type = getattr(ctx, "moe_comm_type", None)
     if local_valid_mask is None:
         if graph_mode:
             raise RuntimeError(
@@ -258,7 +259,6 @@ def apply_topology_aware_routing(
         max_local_tokens, allow_prepare=not graph_mode)
 
     output_rows = int(topk_weights.shape[0])
-    comm_type = getattr(ctx, "moe_comm_type", None)
     if comm_type == MoECommType.ALLGATHER:
         global_router_logits = router_logits
         global_valid_mask = local_valid_mask
@@ -293,6 +293,7 @@ def apply_topology_aware_routing(
         top_k,
         **route_kwargs,
     )
+    # print("[TAR DEBUG] Routed weights and IDs generated.")
     routed_ids = routed_ids.to(device=topk_ids.device, dtype=topk_ids.dtype)
     routed_weights = routed_weights.to(device=topk_weights.device,
                                        dtype=topk_weights.dtype)

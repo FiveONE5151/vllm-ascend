@@ -124,6 +124,7 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 import torch_npu
+import vllm_ascend.envs as envs_ascend
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -2213,7 +2214,7 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
 
-        if is_graph_capturing and envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+        if is_graph_capturing and envs_ascend.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
             self._prepare_topology_routing_states_for_graph(num_tokens_padded)
 
         # filter out the valid batch descriptor

@@ -178,7 +178,14 @@ def set_ascend_forward_context(
                     tar_mask = reserved_tar_mask[:num_tokens]
                 tar_mask[:num_actual_tokens] = True
                 tar_mask[num_actual_tokens:] = False
-                forward_context.tar_valid_token_mask = tar_mask
+
+                if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+                    forward_context.tar_valid_token_mask = tar_mask
+                else:
+                    # allgather, should gather valid token mask
+                    global_tar_valid_token_mask = get_dp_group().all_gather(tar_mask, 0)
+                    forward_context.tar_valid_token_mask = global_tar_valid_token_mask
+
 
         try:
             yield
