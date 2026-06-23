@@ -169,44 +169,45 @@ def set_ascend_forward_context(
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
 
-            reserved_tar_mask = get_tar_valid_token_mask()
-            if reserved_tar_mask is not None:
-                if int(reserved_tar_mask.shape[0]) < int(num_tokens):
-                    tar_mask = torch.zeros(num_tokens, dtype=torch.bool,
-                                           device=reserved_tar_mask.device)
-                else:
-                    tar_mask = reserved_tar_mask[:num_tokens]
-                tar_mask[:num_actual_tokens] = True
-                tar_mask[num_actual_tokens:] = False
-
-                if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-                    forward_context.tar_valid_token_mask = tar_mask
-                else:
-                    # allgather, should gather valid token mask. Keep the
-                    # gathered mask in a stable buffer so graph replay reads
-                    # updated contents from the same address captured earlier.
-                    gathered_tar_valid_token_mask = get_dp_group().all_gather(
-                        tar_mask, 0)
-                    reserved_global_tar_mask = get_global_tar_valid_token_mask()
-                    if (reserved_global_tar_mask is not None and
-                            int(reserved_global_tar_mask.shape[0]) >=
-                            int(gathered_tar_valid_token_mask.shape[0])):
-                        global_tar_valid_token_mask = reserved_global_tar_mask[
-                            :gathered_tar_valid_token_mask.shape[0]]
-                        global_tar_valid_token_mask.copy_(
-                            gathered_tar_valid_token_mask)
+            if envs_ascend.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+                reserved_tar_mask = get_tar_valid_token_mask()
+                if reserved_tar_mask is not None:
+                    if int(reserved_tar_mask.shape[0]) < int(num_tokens):
+                        tar_mask = torch.zeros(num_tokens, dtype=torch.bool,
+                                            device=reserved_tar_mask.device)
                     else:
-                        runtime_mode_name = getattr(aclgraph_runtime_mode,
-                                                    "name", "NONE")
-                        if runtime_mode_name != "NONE":
-                            raise RuntimeError(
-                                "Graph topology-aware routing requires a stable "
-                                "global valid-token mask buffer large enough for "
-                                f"{gathered_tar_valid_token_mask.shape[0]} "
-                                "tokens. Increase cudagraph capture size or "
-                                "reserved TAR mask capacity.")
-                        global_tar_valid_token_mask = gathered_tar_valid_token_mask
-                    forward_context.tar_valid_token_mask = global_tar_valid_token_mask
+                        tar_mask = reserved_tar_mask[:num_tokens]
+                    tar_mask[:num_actual_tokens] = True
+                    tar_mask[num_actual_tokens:] = False
+
+                    if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+                        forward_context.tar_valid_token_mask = tar_mask
+                    else:
+                        # allgather, should gather valid token mask. Keep the
+                        # gathered mask in a stable buffer so graph replay reads
+                        # updated contents from the same address captured earlier.
+                        gathered_tar_valid_token_mask = get_dp_group().all_gather(
+                            tar_mask, 0)
+                        reserved_global_tar_mask = get_global_tar_valid_token_mask()
+                        if (reserved_global_tar_mask is not None and
+                                int(reserved_global_tar_mask.shape[0]) >=
+                                int(gathered_tar_valid_token_mask.shape[0])):
+                            global_tar_valid_token_mask = reserved_global_tar_mask[
+                                :gathered_tar_valid_token_mask.shape[0]]
+                            global_tar_valid_token_mask.copy_(
+                                gathered_tar_valid_token_mask)
+                        else:
+                            runtime_mode_name = getattr(aclgraph_runtime_mode,
+                                                        "name", "NONE")
+                            if runtime_mode_name != "NONE":
+                                raise RuntimeError(
+                                    "Graph topology-aware routing requires a stable "
+                                    "global valid-token mask buffer large enough for "
+                                    f"{gathered_tar_valid_token_mask.shape[0]} "
+                                    "tokens. Increase cudagraph capture size or "
+                                    "reserved TAR mask capacity.")
+                            global_tar_valid_token_mask = gathered_tar_valid_token_mask
+                        forward_context.tar_valid_token_mask = global_tar_valid_token_mask
 
 
         try:

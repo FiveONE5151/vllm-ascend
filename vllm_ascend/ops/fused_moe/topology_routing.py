@@ -200,8 +200,8 @@ def apply_topology_aware_routing(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del global_num_experts, num_local_experts, ep_rank, ep_size
     del moe_instance_id, layer_name
-    if not envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
-        return topk_weights, topk_ids
+    # if not envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+    #     return topk_weights, topk_ids
     if envs.VLLM_ENABLE_TOKEN_DROP:
         raise ValueError(
             "Topology-aware routing and token drop are mutually exclusive. "
@@ -217,15 +217,15 @@ def apply_topology_aware_routing(
             "passed from the AscendFusedMoE layer.")
 
     ctx = get_forward_context()
-    if envs.VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY and not bool(
-            getattr(ctx, "uniform_decode", False)):
-        return topk_weights, topk_ids
+    # if envs.VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY and not bool(
+    #         getattr(ctx, "uniform_decode", False)):
+    #     return topk_weights, topk_ids
     if scoring_func == "sigmoid":
         raise ValueError(
             "Topology-aware routing currently supports softmax/logits/raw "
             "scoring only; got scoring_func='sigmoid'.")
-    if router_logits is None:
-        return topk_weights, topk_ids
+    # if router_logits is None:
+    #     return topk_weights, topk_ids
     if int(top_k) != topology_routing_state.top_k:
         raise RuntimeError(
             f"TAR state top_k={topology_routing_state.top_k} does not match "
@@ -255,15 +255,15 @@ def apply_topology_aware_routing(
         max_local_tokens = int(local_valid_mask.shape[0])
         _validate_fixed_local_shape(router_logits, "router_logits",
                                     max_local_tokens)
-        _validate_fixed_local_shape(topk_weights, "topk_weights",
-                                    max_local_tokens)
-        _validate_fixed_local_shape(topk_ids, "topk_ids", max_local_tokens)
+        # _validate_fixed_local_shape(topk_weights, "topk_weights",
+        #                             max_local_tokens)
+        # _validate_fixed_local_shape(topk_ids, "topk_ids", max_local_tokens)
         local_valid_mask = local_valid_mask.to(device=router_logits.device,
                                                dtype=torch.bool)
     layout = topology_routing_state.get_prepared(
         max_local_tokens, allow_prepare=not graph_mode)
 
-    output_rows = int(topk_weights.shape[0])
+    output_rows = int(router_logits.shape[0])
     if comm_type == MoECommType.ALLGATHER:
         global_router_logits = router_logits
         global_valid_mask = local_valid_mask
@@ -315,11 +315,11 @@ def apply_topology_aware_routing(
         top_k,
         **route_kwargs,
     )
-    if ctx.my_capturing:
-        print("[TAR CAPTURING] Routed weights and IDs generated under graph capturing.")
-    routed_ids = routed_ids.to(device=topk_ids.device, dtype=topk_ids.dtype)
-    routed_weights = routed_weights.to(device=topk_weights.device,
-                                       dtype=topk_weights.dtype)
+    # if ctx.my_capturing:
+    #     print("[TAR CAPTURING] Routed weights and IDs generated under graph capturing.")
+    routed_ids = routed_ids.to(device=router_logits.device, dtype=torch.int32)
+    routed_weights = routed_weights.to(device=router_logits.device,
+                                       dtype=torch.bfloat16)
 
     local_routed_weights = routed_weights[rank_start:rank_end]
     local_routed_ids = routed_ids[rank_start:rank_end]
