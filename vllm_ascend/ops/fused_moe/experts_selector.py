@@ -95,23 +95,30 @@ def select_experts(hidden_states: torch.Tensor,
         scoring_func=scoring_func,
         custom_routing_function=custom_routing_function)
     ctx = get_forward_context()
-    if envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING and ctx.uniform_decode:
-            topk_weights, topk_ids = apply_topology_aware_routing(
-        router_logits=router_logits,
-        topk_weights=None,
-        topk_ids=None,
-        top_k=top_k,
-        scoring_func=scoring_func,
-        renormalize=renormalize,
-        global_num_experts=global_num_experts,
-        num_local_experts=num_local_experts,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
-        ep_group=ep_group if ep_group is not None else get_ep_group().device_group,
-        moe_instance_id=moe_instance_id,
-        layer_name=layer_name,
-        topology_routing_state=topology_routing_state,
-    )
+    if envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING and bool(ctx.uniform_decode):
+        topk_weights, topk_ids = apply_topology_aware_routing(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            topk_weights=None,
+            topk_ids=None,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            scoring_func=scoring_func,
+            renormalize=renormalize,
+            global_num_experts=global_num_experts,
+            num_local_experts=num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            ep_group=ep_group if ep_group is not None else get_ep_group().device_group,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            moe_instance_id=moe_instance_id,
+            layer_name=layer_name,
+            topology_routing_state=topology_routing_state,
+        )
     else:
         if is_support_npu_moe_gating_top_k:
             topk_weights, topk_ids = _select_experts_with_fusion_ops(

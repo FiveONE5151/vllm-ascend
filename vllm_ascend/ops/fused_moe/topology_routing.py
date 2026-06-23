@@ -33,6 +33,7 @@ _STEP_BY_LAYER: dict[tuple[int, str], int] = {}
 _TOPOLOGY_CONFIG_CACHE: tuple[str, Any | None] | None = None
 _SOLVER_CONFIG_CACHE: tuple[str, Any | None] | None = None
 _TOKEN_TOPOLOGY_CONFIG_CACHE: tuple[str, Any | None] | None = None
+_LOG_SKIP_WARNINGS: set[str] = set()
 
 
 @dataclass
@@ -104,6 +105,20 @@ class TopologyRoutingState:
         _validate_expert_ranks_cover_virtual_topology(
             expert_physical_ranks, rank_to_node, virtual_ep_size)
 
+        # logger.info(
+        #     "TAR from_layer: runtime_ep_size=%d ep_rank=%d virtual_ep_size=%d "
+        #     "runtime_num_local_experts=%d virtual_num_local_experts=%d "
+        #     "global_num_experts=%d expert_physical_ranks=%s rank_to_node=%s",
+        #     runtime_ep_size,
+        #     ep_rank,
+        #     virtual_ep_size,
+        #     runtime_num_local_experts,
+        #     virtual_num_local_experts,
+        #     global_num_experts,
+        #     expert_physical_ranks.detach().cpu().tolist(),
+        #     None if rank_to_node is None else rank_to_node.detach().cpu().tolist(),
+        # )
+
         return cls(
             ep_rank=ep_rank,
             runtime_ep_size=runtime_ep_size,
@@ -136,6 +151,12 @@ class TopologyRoutingState:
             token_topology_config=self.token_topology_config,
             device=device,
         )
+        # logger.info(
+        #     "TAR token source rank for max_local_tokens=%d, max_global_tokens=%d: %s",
+        #     max_local_tokens,
+        #     max_global_tokens,
+        #     token_source_ranks.detach().cpu().tolist()
+        # )
         local_start = self.ep_rank * max_local_tokens
         local_end = local_start + max_local_tokens
         row_ids = torch.arange(max_local_tokens, dtype=torch.long, device=device)
@@ -183,10 +204,12 @@ def validate_topology_routing_runtime(*, multistream_overlap_gate: bool) -> None
 
 def apply_topology_aware_routing(
     *,
+    hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
     top_k: int,
+    use_grouped_topk: bool,
     scoring_func: str,
     renormalize: bool,
     global_num_experts: int,
@@ -194,38 +217,31 @@ def apply_topology_aware_routing(
     ep_rank: int,
     ep_size: int,
     ep_group,
+    topk_group: Optional[int] = None,
+    num_expert_group: Optional[int] = None,
+    custom_routing_function: Optional[Any] = None,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: Optional[torch.Tensor] = None,
     moe_instance_id: Optional[int] = None,
     layer_name: Optional[str] = None,
     topology_routing_state: Optional[TopologyRoutingState] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del global_num_experts, num_local_experts, ep_rank, ep_size
-    del moe_instance_id, layer_name
-    # if not envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
-    #     return topk_weights, topk_ids
     if envs.VLLM_ENABLE_TOKEN_DROP:
         raise ValueError(
             "Topology-aware routing and token drop are mutually exclusive. "
             "Set only one of VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING or "
             "VLLM_ENABLE_TOKEN_DROP.")
-    if envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING:
-        raise ValueError(
-            "VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING is not supported by the "
-            "graph-compatible TAR runtime path.")
     if topology_routing_state is None:
         raise RuntimeError(
             "Topology-aware routing is enabled but no TopologyRoutingState was "
             "passed from the AscendFusedMoE layer.")
 
     ctx = get_forward_context()
-    # if envs.VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY and not bool(
-    #         getattr(ctx, "uniform_decode", False)):
-    #     return topk_weights, topk_ids
     if scoring_func == "sigmoid":
         raise ValueError(
             "Topology-aware routing currently supports softmax/logits/raw "
             "scoring only; got scoring_func='sigmoid'.")
-    # if router_logits is None:
-    #     return topk_weights, topk_ids
     if int(top_k) != topology_routing_state.top_k:
         raise RuntimeError(
             f"TAR state top_k={topology_routing_state.top_k} does not match "
@@ -236,11 +252,15 @@ def apply_topology_aware_routing(
     graph_mode = bool(getattr(ctx, "my_capturing", False) or
                       getattr(ctx, "capturing", False) or
                       runtime_mode_name != "NONE")
+    logging_requested = bool(envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING)
+    logging_enabled = logging_requested
+    if logging_enabled and graph_mode:
+        _warn_skip_routing_log_once(
+            "graph_mode",
+            "Skip TAR routing log because graph/full-cudagraph mode does not "
+            "provide per-step online logging semantics.")
+        logging_enabled = False
 
-    # for verification only, remove later
-    # if graph_mode:
-    #     return topk_weights, topk_ids
-    
     local_valid_mask = getattr(ctx, "tar_valid_token_mask", None)
     comm_type = getattr(ctx, "moe_comm_type", None)
     if local_valid_mask is None:
@@ -255,9 +275,6 @@ def apply_topology_aware_routing(
         max_local_tokens = int(local_valid_mask.shape[0])
         _validate_fixed_local_shape(router_logits, "router_logits",
                                     max_local_tokens)
-        # _validate_fixed_local_shape(topk_weights, "topk_weights",
-        #                             max_local_tokens)
-        # _validate_fixed_local_shape(topk_ids, "topk_ids", max_local_tokens)
         local_valid_mask = local_valid_mask.to(device=router_logits.device,
                                                dtype=torch.bool)
     layout = topology_routing_state.get_prepared(
@@ -293,38 +310,71 @@ def apply_topology_aware_routing(
     }
     if global_valid_mask is not None:
         route_kwargs["valid_token_mask"] = global_valid_mask
-    
-    # [yiwu] debug to check whehter the valid token mask is correctly gathered and passed to the route function. Remove after verification.
-    # if not ctx.my_capturing and not ctx.is_graph_warmup:
-    #     print(
-    #         "[TAR DEBUG]",
-    #         "my_capturing=", getattr(ctx, "my_capturing", None),
-    #         "capturing=", getattr(ctx, "capturing", None),
-    #         "warmup=", getattr(ctx, "is_graph_warmup", None),
-    #         "runtime_mode=", ctx.cudagraph_runtime_mode.name,
-    #         "mask_ptr=", None if global_valid_mask is None else
-    #         global_valid_mask.data_ptr(),
-    #         "mask_sum=", None if global_valid_mask is None else
-    #         int(global_valid_mask.sum().item()),
-    #         "mask_shape=", None if global_valid_mask is None else
-    #         tuple(global_valid_mask.shape),
-    #         "uniform_decode=", bool(ctx.uniform_decode),
-    #     )
+
     routed_weights, routed_ids = route(
         global_router_logits,
         top_k,
         **route_kwargs,
     )
-    # if ctx.my_capturing:
-    #     print("[TAR CAPTURING] Routed weights and IDs generated under graph capturing.")
     routed_ids = routed_ids.to(device=router_logits.device, dtype=torch.int32)
     routed_weights = routed_weights.to(device=router_logits.device,
                                        dtype=torch.bfloat16)
 
+    if logging_enabled:
+        baseline_topk_weights = topk_weights
+        baseline_topk_ids = topk_ids
+        if baseline_topk_ids is None or baseline_topk_weights is None:
+            baseline_topk_weights, baseline_topk_ids = _compute_local_baseline_topk(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+                global_num_experts=topology_routing_state.global_num_experts,
+            )
+        runtime_token_counts = _resolve_token_counts(
+            router_logits,
+            topology_routing_state.runtime_ep_size,
+            topology_routing_state.ep_rank,
+            comm_type,
+        )
+        if comm_type == MoECommType.ALLGATHER:
+            global_before_topk_ids = baseline_topk_ids
+        else:
+            global_before_topk_ids = _gather_uneven(
+                baseline_topk_ids, runtime_token_counts, ep_group)
+        token_source_ranks = layout.token_source_ranks[:global_rows]
+        _save_routing_log(
+            router_logits=global_router_logits,
+            before_topk_ids=global_before_topk_ids,
+            after_topk_ids=routed_ids,
+            token_counts=_token_counts_from_source_ranks(
+                token_source_ranks, topology_routing_state.virtual_ep_size),
+            actual_token_counts=runtime_token_counts,
+            token_source_ranks=token_source_ranks,
+            token_source_rank_mapping=_token_source_rank_mapping(
+                topology_routing_state.token_topology_config,
+                topology_routing_state.virtual_ep_size),
+            expert_physical_ranks=topology_routing_state.expert_physical_ranks,
+            top_k=top_k,
+            num_experts=int(global_router_logits.shape[1]),
+            num_local_experts=topology_routing_state.virtual_num_local_experts,
+            moe_instance_id=moe_instance_id,
+            layer_name=layer_name,
+            comm_type=comm_type,
+            route_method=topology_routing_state.route_method,
+            solver_config=topology_routing_state.solver_config,
+        )
+
+
     local_routed_weights = routed_weights[rank_start:rank_end]
     local_routed_ids = routed_ids[rank_start:rank_end]
-    # Eager callers still expect the unpadded row count. Graph callers already
-    # pass padded tensors and receive the fixed bucket shape.
     return (local_routed_weights[:output_rows],
             local_routed_ids[:output_rows])
 
@@ -637,6 +687,85 @@ def _expert_physical_ranks(num_experts: int, virtual_num_local_experts: int,
             int(virtual_num_local_experts))
 
 
+def _compute_local_baseline_topk(
+    *,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    custom_routing_function: Optional[Any],
+    scoring_func: str,
+    routed_scaling_factor: float,
+    e_score_correction_bias: Optional[torch.Tensor],
+    global_num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm_ascend.ops.fused_moe import experts_selector as experts_selector_mod
+
+    is_support_npu_moe_gating_top_k =         experts_selector_mod.check_npu_moe_gating_top_k(
+            hidden_states=hidden_states,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            custom_routing_function=custom_routing_function)
+    if is_support_npu_moe_gating_top_k:
+        return experts_selector_mod._select_experts_with_fusion_ops(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            e_score_correction_bias=e_score_correction_bias,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            global_num_experts=global_num_experts)
+    return experts_selector_mod._native_select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=top_k,
+        use_grouped_topk=use_grouped_topk,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        custom_routing_function=custom_routing_function,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias,
+        global_num_experts=global_num_experts,
+    )
+
+
+def _warn_skip_routing_log_once(key: str, message: str) -> None:
+    if key in _LOG_SKIP_WARNINGS or not _is_global_rank0():
+        return
+    _LOG_SKIP_WARNINGS.add(key)
+    logger.warning("[TopologyRouting] %s", message)
+
+
+def _token_counts_from_source_ranks(token_source_ranks: torch.Tensor,
+                                    ep_size: int) -> torch.Tensor:
+    return torch.bincount(token_source_ranks.to(dtype=torch.long).cpu(),
+                          minlength=int(ep_size)).to(dtype=torch.int32)
+
+
+def _token_source_rank_mapping(token_topology_config,
+                               ep_size: int) -> dict[str, Any]:
+    if token_topology_config is None:
+        return {"mode": "unknown", "ep_size": int(ep_size)}
+    return {
+        "mode": getattr(token_topology_config, "token_source_policy", None),
+        "name": getattr(token_topology_config, "name", None),
+        "remainder_policy": getattr(token_topology_config,
+                                     "remainder_policy", None),
+        "order": getattr(token_topology_config, "order", None),
+        "ep_size": int(ep_size),
+    }
+
 def _is_global_rank0() -> bool:
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank() == 0
@@ -660,6 +789,7 @@ def _save_routing_log(
     before_topk_ids: torch.Tensor,
     after_topk_ids: torch.Tensor,
     token_counts: torch.Tensor,
+    actual_token_counts: torch.Tensor,
     token_source_ranks: torch.Tensor,
     token_source_rank_mapping: dict[str, Any],
     expert_physical_ranks: torch.Tensor,
@@ -670,8 +800,6 @@ def _save_routing_log(
     layer_name: Optional[str],
     comm_type: Optional[MoECommType],
     route_method: str,
-    topology_config,
-    token_topology_config,
     solver_config,
 ) -> None:
     if not _is_global_rank0():
@@ -706,9 +834,9 @@ def _save_routing_log(
         "shape": tuple(router_logits.shape),
         "dtype": str(router_logits.dtype),
         "router_logits": router_logits.detach().cpu().contiguous(),
-        "token_source_ranks": token_source_ranks.to(torch.int32).contiguous(),
-        "num_tokens_across_ranks": token_counts.detach().cpu().contiguous(),
-        "actual_token_counts": token_counts.detach().cpu().to(torch.int32).contiguous(),
+        "token_source_ranks": token_source_ranks.detach().cpu().to(torch.int32).contiguous(),
+        "num_tokens_across_ranks": token_counts.detach().cpu().to(torch.int32).contiguous(),
+        "actual_token_counts": actual_token_counts.detach().cpu().to(torch.int32).contiguous(),
         "expert_physical_ranks": expert_physical_ranks.detach().cpu().to(torch.int32).contiguous(),
         "expert_rank_semantics": "physical",
         "ep_size": int(token_counts.numel()),
