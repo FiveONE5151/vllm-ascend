@@ -236,6 +236,11 @@ def apply_topology_aware_routing(
     graph_mode = bool(getattr(ctx, "my_capturing", False) or
                       getattr(ctx, "capturing", False) or
                       runtime_mode_name != "NONE")
+
+    # for verification only, remove later
+    # if graph_mode:
+    #     return topk_weights, topk_ids
+    
     local_valid_mask = getattr(ctx, "tar_valid_token_mask", None)
     comm_type = getattr(ctx, "moe_comm_type", None)
     if local_valid_mask is None:
@@ -288,12 +293,30 @@ def apply_topology_aware_routing(
     }
     if global_valid_mask is not None:
         route_kwargs["valid_token_mask"] = global_valid_mask
+    
+    # [yiwu] debug to check whehter the valid token mask is correctly gathered and passed to the route function. Remove after verification.
+    # if not ctx.my_capturing and not ctx.is_graph_warmup:
+    #     print(
+    #         "[TAR DEBUG]",
+    #         "my_capturing=", getattr(ctx, "my_capturing", None),
+    #         "capturing=", getattr(ctx, "capturing", None),
+    #         "warmup=", getattr(ctx, "is_graph_warmup", None),
+    #         "runtime_mode=", ctx.cudagraph_runtime_mode.name,
+    #         "mask_ptr=", None if global_valid_mask is None else
+    #         global_valid_mask.data_ptr(),
+    #         "mask_sum=", None if global_valid_mask is None else
+    #         int(global_valid_mask.sum().item()),
+    #         "mask_shape=", None if global_valid_mask is None else
+    #         tuple(global_valid_mask.shape),
+    #         "uniform_decode=", bool(ctx.uniform_decode),
+    #     )
     routed_weights, routed_ids = route(
         global_router_logits,
         top_k,
         **route_kwargs,
     )
-    # print("[TAR DEBUG] Routed weights and IDs generated.")
+    if ctx.my_capturing:
+        print("[TAR CAPTURING] Routed weights and IDs generated under graph capturing.")
     routed_ids = routed_ids.to(device=topk_ids.device, dtype=topk_ids.dtype)
     routed_weights = routed_weights.to(device=topk_weights.device,
                                        dtype=topk_weights.dtype)

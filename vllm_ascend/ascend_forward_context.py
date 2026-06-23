@@ -182,8 +182,30 @@ def set_ascend_forward_context(
                 if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
                     forward_context.tar_valid_token_mask = tar_mask
                 else:
-                    # allgather, should gather valid token mask
-                    global_tar_valid_token_mask = get_dp_group().all_gather(tar_mask, 0)
+                    # allgather, should gather valid token mask. Keep the
+                    # gathered mask in a stable buffer so graph replay reads
+                    # updated contents from the same address captured earlier.
+                    gathered_tar_valid_token_mask = get_dp_group().all_gather(
+                        tar_mask, 0)
+                    reserved_global_tar_mask = get_global_tar_valid_token_mask()
+                    if (reserved_global_tar_mask is not None and
+                            int(reserved_global_tar_mask.shape[0]) >=
+                            int(gathered_tar_valid_token_mask.shape[0])):
+                        global_tar_valid_token_mask = reserved_global_tar_mask[
+                            :gathered_tar_valid_token_mask.shape[0]]
+                        global_tar_valid_token_mask.copy_(
+                            gathered_tar_valid_token_mask)
+                    else:
+                        runtime_mode_name = getattr(aclgraph_runtime_mode,
+                                                    "name", "NONE")
+                        if runtime_mode_name != "NONE":
+                            raise RuntimeError(
+                                "Graph topology-aware routing requires a stable "
+                                "global valid-token mask buffer large enough for "
+                                f"{gathered_tar_valid_token_mask.shape[0]} "
+                                "tokens. Increase cudagraph capture size or "
+                                "reserved TAR mask capacity.")
+                        global_tar_valid_token_mask = gathered_tar_valid_token_mask
                     forward_context.tar_valid_token_mask = global_tar_valid_token_mask
 
 
@@ -196,6 +218,7 @@ def set_ascend_forward_context(
 _mc2_tokens_capacity: Optional[int] = None
 _reserved_mc2_mask: Optional[torch.Tensor] = None
 _reserved_tar_valid_token_mask: Optional[torch.Tensor] = None
+_reserved_global_tar_valid_token_mask: Optional[torch.Tensor] = None
 _sin: Optional[torch.Tensor] = None
 _cos: Optional[torch.Tensor] = None
 
@@ -239,11 +262,13 @@ def get_mc2_mask():
 
 def set_tar_valid_token_mask(vllm_config, device):
     global _reserved_tar_valid_token_mask
+    global _reserved_global_tar_valid_token_mask
     if _reserved_tar_valid_token_mask is not None:
         return
     if not (is_moe_model(vllm_config)
             and envs_ascend.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING):
         _reserved_tar_valid_token_mask = None
+        _reserved_global_tar_valid_token_mask = None
         return
     if vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
@@ -252,10 +277,18 @@ def set_tar_valid_token_mask(vllm_config, device):
     _reserved_tar_valid_token_mask = torch.zeros(max_num_tokens,
                                                  dtype=torch.bool,
                                                  device=device)
+    dp_size = int(vllm_config.parallel_config.data_parallel_size)
+    _reserved_global_tar_valid_token_mask = torch.zeros(max_num_tokens * dp_size,
+                                                        dtype=torch.bool,
+                                                        device=device)
 
 
 def get_tar_valid_token_mask():
     return _reserved_tar_valid_token_mask
+
+
+def get_global_tar_valid_token_mask():
+    return _reserved_global_tar_valid_token_mask
 
 
 def select_moe_comm_method(num_tokens: int,

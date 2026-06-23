@@ -1547,6 +1547,19 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora,
                                                disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value)
         num_input_tokens = batch_descriptor.num_tokens
+        # [yiwu] debug to inspect why decode batches dispatch to graph or eager.
+        # Remove after topology-aware routing graph-mode verification.
+        # print(
+        #     "[GRAPH DEBUG]",
+        #     "total=", scheduler_output.total_num_scheduled_tokens,
+        #     "num_reqs=", self.input_batch.num_reqs,
+        #     "max_query_len=", max_query_len,
+        #     "uniform_decode=", uniform_decode,
+        #     "num_input_tokens=", num_input_tokens,
+        #     "synced_cudagraph_mode=", synced_cudagraph_mode,
+        #     "runtime_mode=", aclgraph_runtime_mode,
+        #     "batch_descriptor=", batch_descriptor,
+        # )
 
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
@@ -2227,6 +2240,26 @@ class NPUModelRunner(GPUModelRunner):
                     f"Expected {_ag_mode}, but got {cudagraph_runtime_mode}.")
         else:
             cudagraph_runtime_mode = _ag_mode
+
+        # [yiwu] debug to inspect graph dispatch decisions on dummy ranks.
+        # Remove after topology-aware routing graph-mode verification.
+        # print(
+        #     "[GRAPH DUMMY DEBUG]",
+        #     "num_tokens=", num_tokens,
+        #     "num_tokens_padded=", num_tokens_padded,
+        #     "num_reqs=", num_reqs,
+        #     "num_reqs_padded=", num_reqs_padded,
+        #     "uniform_decode=", uniform_decode,
+        #     "with_prefill=", with_prefill,
+        #     "is_profile=", is_profile,
+        #     "is_graph_capturing=", is_graph_capturing,
+        #     "is_graph_warmup=", is_graph_warmup,
+        #     "force_attention=", force_attention,
+        #     "synced_cudagraph_mode=", synced_cudagraph_mode,
+        #     "runtime_mode=", cudagraph_runtime_mode,
+        #     "batch_descriptor=", batch_descriptor,
+        #     "num_tokens_across_dp=", num_tokens_across_dp,
+        # )
 
         # TODO(Mengqing): Set create_mixed_batch to False since it's only used in FI warmup
         # and not supported in ASCEND now. We could remove it in the future.
