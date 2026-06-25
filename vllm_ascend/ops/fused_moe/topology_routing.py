@@ -310,6 +310,13 @@ def apply_topology_aware_routing(
     }
     if global_valid_mask is not None:
         route_kwargs["valid_token_mask"] = global_valid_mask
+    logger.info(
+        "[TopologyRouting] mask valid=%d total=%d logits_shape=%s comm=%s",
+        int(global_valid_mask.sum().item()) if global_valid_mask is not None else -1,
+        int(global_valid_mask.numel()) if global_valid_mask is not None else -1,
+        tuple(global_router_logits.shape),
+        comm_type.name if comm_type is not None else None,
+    )
 
     routed_weights, routed_ids = route(
         global_router_logits,
@@ -354,6 +361,7 @@ def apply_topology_aware_routing(
             router_logits=global_router_logits,
             before_topk_ids=global_before_topk_ids,
             after_topk_ids=routed_ids,
+            valid_token_mask=global_valid_mask,
             token_counts=_token_counts_from_source_ranks(
                 token_source_ranks, topology_routing_state.virtual_ep_size),
             actual_token_counts=runtime_token_counts,
@@ -788,6 +796,7 @@ def _save_routing_log(
     router_logits: torch.Tensor,
     before_topk_ids: torch.Tensor,
     after_topk_ids: torch.Tensor,
+    valid_token_mask: torch.Tensor | None,
     token_counts: torch.Tensor,
     actual_token_counts: torch.Tensor,
     token_source_ranks: torch.Tensor,
@@ -811,6 +820,12 @@ def _save_routing_log(
     log_root = Path(envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR)
     safe_layer = _safe_layer_name(layer)
     file_name = f"router_logits_layer_{instance_id}_step_{step}_{safe_layer}.pt"
+    if valid_token_mask is None:
+        valid_token_mask = torch.ones(
+            int(router_logits.shape[0]), dtype=torch.bool, device=router_logits.device)
+    else:
+        valid_token_mask = valid_token_mask.to(device=router_logits.device,
+                                               dtype=torch.bool)
 
     common_metadata = {
         "moe_instance_id": instance_id,
@@ -834,6 +849,7 @@ def _save_routing_log(
         "shape": tuple(router_logits.shape),
         "dtype": str(router_logits.dtype),
         "router_logits": router_logits.detach().cpu().contiguous(),
+        "valid_token_mask": valid_token_mask.detach().cpu().contiguous(),
         "token_source_ranks": token_source_ranks.detach().cpu().to(torch.int32).contiguous(),
         "num_tokens_across_ranks": token_counts.detach().cpu().to(torch.int32).contiguous(),
         "actual_token_counts": actual_token_counts.detach().cpu().to(torch.int32).contiguous(),
