@@ -310,13 +310,13 @@ def apply_topology_aware_routing(
     }
     if global_valid_mask is not None:
         route_kwargs["valid_token_mask"] = global_valid_mask
-    logger.info(
-        "[TopologyRouting] mask valid=%d total=%d logits_shape=%s comm=%s",
-        int(global_valid_mask.sum().item()) if global_valid_mask is not None else -1,
-        int(global_valid_mask.numel()) if global_valid_mask is not None else -1,
-        tuple(global_router_logits.shape),
-        comm_type.name if comm_type is not None else None,
-    )
+    # logger.info(
+    #     "[TopologyRouting] mask valid=%d total=%d logits_shape=%s comm=%s",
+    #     int(global_valid_mask.sum().item()) if global_valid_mask is not None else -1,
+    #     int(global_valid_mask.numel()) if global_valid_mask is not None else -1,
+    #     tuple(global_router_logits.shape),
+    #     comm_type.name if comm_type is not None else None,
+    # )
 
     routed_weights, routed_ids = route(
         global_router_logits,
