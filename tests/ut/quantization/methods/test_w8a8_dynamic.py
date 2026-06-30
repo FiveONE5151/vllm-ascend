@@ -154,6 +154,13 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         layer.w13_weight_scale_fp32 = torch.ones(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32)
         layer.w2_weight_scale = torch.ones(self.num_experts, hidden_size, dtype=torch.float32)
         layer.swiglu_limit = 1000000
+        layer.local_num_experts = self.num_experts
+        layer.ep_rank = 0
+        layer.ep_size = 1
+        layer.ep_group = "ep_group"
+        layer.moe_instance_id = 3
+        layer.layer_name = "model.layers.0.mlp"
+        layer.topology_routing_state = object()
 
         x = torch.randn(tokens, hidden_size, dtype=torch.float32)
         router_logits = torch.randn(tokens, self.num_experts, dtype=torch.float32)
@@ -182,6 +189,15 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             mc2_mask=mc2_mask,
             pertoken_scale=pertoken_scale,
         )
+
+        select_kwargs = mock_select_experts.call_args.kwargs
+        self.assertEqual(select_kwargs["num_local_experts"], self.num_experts)
+        self.assertEqual(select_kwargs["ep_rank"], 0)
+        self.assertEqual(select_kwargs["ep_size"], 1)
+        self.assertEqual(select_kwargs["ep_group"], "ep_group")
+        self.assertEqual(select_kwargs["moe_instance_id"], 3)
+        self.assertEqual(select_kwargs["layer_name"], "model.layers.0.mlp")
+        self.assertIs(select_kwargs["topology_routing_state"], layer.topology_routing_state)
 
         fused_experts_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
         self.assertEqual(fused_experts_input.activation, "gelu")

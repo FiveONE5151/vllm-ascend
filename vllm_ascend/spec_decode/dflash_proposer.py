@@ -220,6 +220,7 @@ class AscendDflashProposer(AscendEagleProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
         ):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)

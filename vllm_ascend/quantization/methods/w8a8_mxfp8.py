@@ -282,6 +282,13 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_logical_experts,
             tid2eid=tid2eid,
+            num_local_experts=getattr(layer, "local_num_experts", None),
+            ep_rank=getattr(layer, "ep_rank", None),
+            ep_size=getattr(layer, "ep_size", None),
+            ep_group=getattr(layer, "ep_group", None),
+            moe_instance_id=getattr(layer, "moe_instance_id", None),
+            layer_name=getattr(layer, "layer_name", None),
+            topology_routing_state=getattr(layer, "topology_routing_state", None),
         )
 
         # this is a naive implementation for experts load balance so as

@@ -39,6 +39,7 @@ class AscendMedusaProposer(MedusaProposer):
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
+            uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
         ):
             self.model(hidden_states)
             dummy_compute_logits(hidden_states)

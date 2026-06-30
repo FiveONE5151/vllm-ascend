@@ -70,6 +70,7 @@ def set_ascend_forward_context(
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
+    uniform_decode: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -89,6 +90,7 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+        forward_context.uniform_decode = uniform_decode
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -185,6 +187,28 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
+
+            reserved_tar_mask = get_tar_valid_token_mask()
+            if reserved_tar_mask is not None:
+                tar_mask = reserved_tar_mask[: forward_context.padded_num_tokens]
+                tar_mask[:num_actual_tokens] = True
+                tar_mask[num_actual_tokens:] = False
+                forward_context.tar_valid_token_mask = tar_mask
+
+            reserved_tar_global_mask = get_tar_global_valid_token_mask()
+            if reserved_tar_global_mask is not None:
+                global_mask = reserved_tar_global_mask[: forward_context.padded_num_tokens * dp_world_size]
+                global_mask.fill_(False)
+                counts = None
+                if forward_context.dp_metadata is not None:
+                    counts = forward_context.dp_metadata.num_tokens_across_dp_cpu
+                if counts is None:
+                    counts = torch.tensor([num_actual_tokens], dtype=torch.int64)
+                for rank, count in enumerate(counts):
+                    start = rank * forward_context.padded_num_tokens
+                    valid = min(int(count), forward_context.padded_num_tokens)
+                    global_mask[start:start + valid] = True
+                forward_context.tar_global_valid_token_mask = global_mask
         try:
             yield
         finally:
@@ -228,6 +252,36 @@ def set_mc2_mask(vllm_config, device):
 
 def get_mc2_mask():
     return _reserved_mc2_mask
+
+
+_tar_tokens_capacity: int | None = None
+_reserved_tar_valid_token_mask: torch.Tensor | None = None
+_reserved_tar_global_valid_token_mask: torch.Tensor | None = None
+
+
+def set_tar_valid_token_mask(vllm_config, device):
+    global _tar_tokens_capacity, _reserved_tar_valid_token_mask, _reserved_tar_global_valid_token_mask
+    if _reserved_tar_valid_token_mask is not None:
+        return
+    if not is_moe_model(vllm_config):
+        _tar_tokens_capacity = None
+        _reserved_tar_valid_token_mask = None
+        _reserved_tar_global_valid_token_mask = None
+        return
+    _tar_tokens_capacity = vllm_config.scheduler_config.max_num_batched_tokens
+    dp_size = vllm_config.parallel_config.data_parallel_size
+    _reserved_tar_valid_token_mask = torch.zeros(_tar_tokens_capacity, dtype=torch.bool, device=device)
+    _reserved_tar_global_valid_token_mask = torch.zeros(
+        _tar_tokens_capacity * dp_size, dtype=torch.bool, device=device
+    )
+
+
+def get_tar_valid_token_mask():
+    return _reserved_tar_valid_token_mask
+
+
+def get_tar_global_valid_token_mask():
+    return _reserved_tar_global_valid_token_mask
 
 
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
@@ -334,6 +388,9 @@ class _ExtraForwardContextProxy:
         "padded_length",
         "num_tokens_across_dp",
         "mc2_mask",
+        "tar_valid_token_mask",
+        "tar_global_valid_token_mask",
+        "uniform_decode",
         "is_draft_model",
         "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",

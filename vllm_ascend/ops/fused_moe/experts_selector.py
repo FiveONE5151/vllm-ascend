@@ -21,9 +21,11 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
+import vllm_ascend.envs as envs
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
+from vllm_ascend.ops.fused_moe.topology_routing import apply_topology_aware_routing
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
@@ -46,6 +48,13 @@ def select_experts(
     num_experts: int = -1,
     input_ids: torch.Tensor | None = None,
     tid2eid: torch.Tensor | None = None,
+    num_local_experts: int | None = None,
+    ep_rank: int | None = None,
+    ep_size: int | None = None,
+    ep_group=None,
+    moe_instance_id: int | None = None,
+    layer_name: str | None = None,
+    topology_routing_state=None,
 ):
     """
     Fused experts with select experts.
@@ -81,6 +90,34 @@ def select_experts(
         scoring_func=scoring_func,
         custom_routing_function=custom_routing_function,
     )
+
+    if (
+        envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING
+        and bool(getattr(get_forward_context(), "uniform_decode", False))
+    ):
+        return apply_topology_aware_routing(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            topk_weights=None,
+            topk_ids=None,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            scoring_func=scoring_func,
+            renormalize=renormalize,
+            global_num_experts=num_experts,
+            num_local_experts=int(num_local_experts or 0),
+            ep_rank=int(ep_rank or 0),
+            ep_size=int(ep_size or 1),
+            ep_group=ep_group,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            moe_instance_id=moe_instance_id,
+            layer_name=layer_name,
+            topology_routing_state=topology_routing_state,
+        )
 
     if is_support_npu_moe_gating_top_k:
         topk_weights, topk_ids = _select_experts_with_fusion_ops(

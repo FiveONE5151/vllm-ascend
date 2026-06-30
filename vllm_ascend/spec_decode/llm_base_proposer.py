@@ -527,6 +527,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
         ):
             # Reset MOE layer index before first model call
             forward_context = get_forward_context()
@@ -867,6 +868,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            uniform_decode=uniform_decode,
         ):
             # Reset MOE layer index for forward pass
             forward_context = get_forward_context()

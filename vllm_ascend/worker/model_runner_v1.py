@@ -160,10 +160,12 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    set_tar_valid_token_mask,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
+from vllm_ascend.ops.fused_moe.topology_routing import topology_aware_routing_enabled
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -430,6 +432,7 @@ class NPUModelRunner(GPUModelRunner):
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
+        set_tar_valid_token_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
@@ -2020,6 +2023,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
+                uniform_decode=batch_desc.uniform,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -3284,6 +3288,9 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            if is_graph_capturing or cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                self._prepare_topology_routing_states_for_graph(num_tokens_padded)
+
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3296,6 +3303,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
+                uniform_decode=uniform_decode,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3488,6 +3496,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _prepare_topology_routing_states_for_graph(self, max_local_tokens: int) -> None:
+        if not topology_aware_routing_enabled():
+            return
+        for module in self.get_model().modules():
+            state = getattr(module, "topology_routing_state", None)
+            if state is not None:
+                state.prepare_for_tokens(max_local_tokens)
 
     def _bind_routed_experts_capturer(self, capturer) -> None:
         # Upstream binds via ``module.router.set_capture_fn(...)`` on

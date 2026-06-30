@@ -38,6 +38,7 @@ from vllm_ascend.flash_common3_context import get_flash_common3_context, set_fla
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.topology_routing import TopologyRoutingState, validate_topology_routing_runtime
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -178,6 +179,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_experts=num_logical_experts,
             tid2eid=self.tid2eid,
             input_ids=input_ids,
+            num_local_experts=getattr(layer, "local_num_experts", None),
+            ep_rank=getattr(layer, "ep_rank", None),
+            ep_size=getattr(layer, "ep_size", None),
+            ep_group=getattr(layer, "ep_group", None),
+            moe_instance_id=getattr(layer, "moe_instance_id", None),
+            layer_name=getattr(layer, "layer_name", None),
+            topology_routing_state=getattr(layer, "topology_routing_state", None),
         )
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
@@ -440,6 +448,8 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
+        validate_topology_routing_runtime(multistream_overlap_gate=self.multistream_overlap_gate)
+        self.topology_routing_state = TopologyRoutingState.from_layer(self)
         self.swiglu_limit = getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 0)
 
         moe_quant_params = {
@@ -632,6 +642,13 @@ class AscendFusedMoE(FusedMoE):
                     num_experts=self.moe_config.num_experts,
                     input_ids=input_ids,
                     tid2eid=self.tid2eid,
+                    num_local_experts=self.local_num_experts,
+                    ep_rank=self.ep_rank,
+                    ep_size=self.ep_size,
+                    ep_group=getattr(self, "ep_group", None),
+                    moe_instance_id=self.moe_instance_id,
+                    layer_name=self.layer_name,
+                    topology_routing_state=self.topology_routing_state,
                 )
 
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):

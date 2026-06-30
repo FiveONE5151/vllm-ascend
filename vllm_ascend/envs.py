@@ -114,6 +114,34 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Whether to enable topology-aware routing for MoE expert selection.
+    "VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING", "0"))
+    ),
+    # Routing strategy passed to topology_aware_routing.route().
+    "VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY": lambda: os.getenv(
+        "VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY", "min_cost"
+    ),
+    # Only route uniform decode batches through topology-aware routing.
+    "VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY": lambda: bool(
+        int(os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY", "1"))
+    ),
+    # Save router logits and before/after top-k ids for offline analysis.
+    "VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING": lambda: bool(
+        int(os.getenv("VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING", "0"))
+    ),
+    "VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR": lambda: os.getenv(
+        "VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR", "topology_routing_logs"
+    ),
+    "VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG": lambda: os.getenv(
+        "VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG", ""
+    ),
+    "VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG": lambda: os.getenv(
+        "VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG", ""
+    ),
+    "VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON": lambda: os.getenv(
+        "VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON", ""
+    ),
 }
 
 # end-env-vars-definition
