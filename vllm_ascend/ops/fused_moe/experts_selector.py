@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
-import vllm_ascend.envs as envs
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
@@ -91,10 +90,11 @@ def select_experts(
         custom_routing_function=custom_routing_function,
     )
 
-    if (
-        envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING
-        and bool(getattr(get_forward_context(), "uniform_decode", False))
-    ):
+    # if ep_rank == 0 and not get_forward_context().in_profile_run and not get_forward_context().is_graph_warmup and not get_forward_context().capturing:
+    #     print(f"[select_experts] rank={ep_rank}: tar_across_dp={getattr(get_forward_context(), 'enable_tar_across_dp', [False])}, runtime_enable_tar={getattr(get_forward_context(), 'runtime_enable_tar', False)}")
+    #     print(f"[select_experts] num_tokens_across_dp: {get_forward_context().dp_metadata.num_tokens_across_dp_cpu.tolist()}")
+
+    if bool(getattr(get_forward_context(), "runtime_enable_tar", False)):
         return apply_topology_aware_routing(
             hidden_states=hidden_states,
             router_logits=router_logits,

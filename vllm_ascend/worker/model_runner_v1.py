@@ -1836,6 +1836,7 @@ class NPUModelRunner(GPUModelRunner):
                     should_ubatch,
                     num_tokens_across_dp,
                     cudagraph_stats,
+                    uniform_decode_raw
                 ) = self._determine_batch_execution_and_padding(
                     num_tokens=num_tokens_unpadded,
                     num_reqs=num_reqs,
@@ -2023,7 +2024,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
-                uniform_decode=batch_desc.uniform,
+                uniform_decode=uniform_decode_raw, # [yiwu]
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2635,6 +2636,16 @@ class NPUModelRunner(GPUModelRunner):
             if force_uniform_decode is None
             else force_uniform_decode
         )
+        # print(
+        #     f"[uniform_decode][before_dispatch] "
+        #     f"dp_rank={self.parallel_config.data_parallel_rank} "
+        #     f"num_tokens={num_tokens} num_reqs={num_reqs} "
+        #     f"max_num_scheduled_tokens={max_num_scheduled_tokens} "
+        #     f"uniform_decode_query_len={self.uniform_decode_query_len} "
+        #     f"is_all_decode={is_all_decode} "
+        #     f"raw_uniform_decode={uniform_decode}",
+        #     flush=True,
+        # )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
@@ -2660,6 +2671,17 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        # print(
+        #     f"[uniform_decode][after_dispatch] "
+        #     f"dp_rank={self.parallel_config.data_parallel_rank} "
+        #     f"raw_uniform_decode={uniform_decode} "
+        #     f"batch_desc_uniform={batch_descriptor.uniform} "
+        #     f"equal={uniform_decode == batch_descriptor.uniform} "
+        #     f"cudagraph_mode={cudagraph_mode} "
+        #     f"batch_desc_num_tokens={batch_descriptor.num_tokens} "
+        #     f"batch_desc_num_reqs={batch_descriptor.num_reqs}",
+        #     flush=True,
+        # )
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -2684,6 +2706,18 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded,
                     valid_modes={synced_cudagraph_mode},
                 )
+                # print(
+                #     f"[uniform_decode][after_dp_redispatch] "
+                #     f"dp_rank={self.parallel_config.data_parallel_rank} "
+                #     f"raw_uniform_decode={uniform_decode} "
+                #     f"batch_desc_uniform={batch_descriptor.uniform} "
+                #     f"equal={uniform_decode == batch_descriptor.uniform} "
+                #     f"synced_cudagraph_mode={synced_cudagraph_mode} "
+                #     f"cudagraph_mode={cudagraph_mode} "
+                #     f"num_tokens_padded={num_tokens_padded} "
+                #     f"num_tokens_across_dp={num_tokens_across_dp.tolist() if num_tokens_across_dp is not None else None}",
+                #     flush=True,
+                # )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
@@ -2702,6 +2736,7 @@ class NPUModelRunner(GPUModelRunner):
             should_ubatch,
             num_tokens_across_dp,
             cudagraph_stats,
+            uniform_decode
         )
 
     def _build_attention_metadata(
@@ -3121,7 +3156,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+        _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens,

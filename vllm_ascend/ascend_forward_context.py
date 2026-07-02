@@ -5,11 +5,13 @@ from enum import Enum
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import vllm.envs as envs_vllm
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
+import vllm_ascend.envs as envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -51,6 +53,18 @@ def override_mrv2_in_profile_run(enabled: bool):
 
 def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
+
+
+def _sync_runtime_enable_tar(local_enable_tar: bool, dp_group) -> bool:
+    if dp_group.world_size <= 1:
+        return bool(local_enable_tar)
+
+    enable_tensor = torch.tensor([int(local_enable_tar)], device="cpu", dtype=torch.int32)
+    output_tensor = torch.empty([dp_group.world_size], device="cpu", dtype=torch.int32)
+    dist.all_gather_into_tensor(output_tensor, enable_tensor, group=dp_group.cpu_group)
+    # # print(f"[sync_runtime_enable_tar] rank={dp_group.rank} local_enable_tar={local_enable_tar} gathered={output_tensor.tolist()}")
+    global_enable_tar = torch.min(output_tensor).item()
+    return bool(global_enable_tar), output_tensor.bool().tolist()  # return the global enable_tar and the per-rank enable_tar list
 
 
 @contextmanager
@@ -165,7 +179,11 @@ def set_ascend_forward_context(
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 
-        dp_world_size = get_dp_group().world_size
+        dp_group = get_dp_group()
+        dp_world_size = dp_group.world_size
+        forward_context.runtime_enable_tar = False
+        if envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+            forward_context.runtime_enable_tar, forward_context.enable_tar_across_dp = _sync_runtime_enable_tar(uniform_decode, dp_group)
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
@@ -397,6 +415,7 @@ class _ExtraForwardContextProxy:
         "tar_valid_token_mask",
         "tar_global_valid_token_mask",
         "uniform_decode",
+        "runtime_enable_tar",
         "is_draft_model",
         "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",

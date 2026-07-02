@@ -201,6 +201,64 @@ class TestExpertsSelector:
         assert topk_weights.shape == (8, 2)
         assert topk_ids.shape == (8, 2)
 
+    def test_select_experts_skips_tar_when_runtime_gate_disabled(self):
+        hidden_states = torch.randn(4, 8)
+        router_logits = torch.randn(4, 16)
+        expected_weights = torch.randn(4, 2)
+        expected_ids = torch.randint(0, 16, (4, 2), dtype=torch.int32)
+
+        with (
+            patch("vllm_ascend.ops.fused_moe.experts_selector.get_weight_prefetch_method", return_value=None),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.check_npu_moe_gating_top_k", return_value=False),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.get_forward_context", return_value=MagicMock(runtime_enable_tar=False)),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.apply_topology_aware_routing") as mock_tar,
+            patch("vllm_ascend.ops.fused_moe.experts_selector._native_select_experts", return_value=(expected_weights, expected_ids)) as mock_native,
+        ):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=2,
+                use_grouped_topk=False,
+                renormalize=True,
+                num_experts=16,
+            )
+
+        mock_tar.assert_not_called()
+        mock_native.assert_called_once()
+        assert topk_weights is expected_weights
+        assert topk_ids is expected_ids
+
+    def test_select_experts_uses_tar_when_runtime_gate_enabled(self):
+        hidden_states = torch.randn(4, 8)
+        router_logits = torch.randn(4, 16)
+        expected_weights = torch.randn(4, 2)
+        expected_ids = torch.randint(0, 16, (4, 2), dtype=torch.int32)
+
+        with (
+            patch("vllm_ascend.ops.fused_moe.experts_selector.get_weight_prefetch_method", return_value=None),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.check_npu_moe_gating_top_k", return_value=False),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.get_forward_context", return_value=MagicMock(runtime_enable_tar=True)),
+            patch("vllm_ascend.ops.fused_moe.experts_selector.apply_topology_aware_routing", return_value=(expected_weights, expected_ids)) as mock_tar,
+            patch("vllm_ascend.ops.fused_moe.experts_selector._native_select_experts") as mock_native,
+        ):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=2,
+                use_grouped_topk=False,
+                renormalize=True,
+                num_experts=16,
+                num_local_experts=8,
+                ep_rank=1,
+                ep_size=2,
+                ep_group=object(),
+            )
+
+        mock_tar.assert_called_once()
+        mock_native.assert_not_called()
+        assert topk_weights is expected_weights
+        assert topk_ids is expected_ids
+
     @pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
     @pytest.mark.parametrize("renormalize", [True, False])
     def test_select_experts_with_different_scoring_func(self, mock_dist_env, mock_moe_env, scoring_func, renormalize):

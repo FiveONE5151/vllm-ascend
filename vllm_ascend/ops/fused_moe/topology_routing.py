@@ -361,11 +361,12 @@ def apply_topology_aware_routing(
                 e_score_correction_bias=e_score_correction_bias,
                 global_num_experts=topology_routing_state.global_num_experts,
             )
-        runtime_token_counts = _resolve_token_counts(
+        actual_token_counts, runtime_token_counts = _resolve_token_counts(
             router_logits,
             topology_routing_state.runtime_ep_size,
             topology_routing_state.ep_rank,
             comm_type,
+            global_valid_mask if comm_type == MoECommType.ALLGATHER else local_valid_mask,
         )
         if comm_type == MoECommType.ALLGATHER:
             global_before_topk_ids = baseline_topk_ids
@@ -380,7 +381,7 @@ def apply_topology_aware_routing(
             valid_token_mask=global_valid_mask,
             token_counts=_token_counts_from_source_ranks(
                 token_source_ranks, topology_routing_state.virtual_ep_size),
-            actual_token_counts=runtime_token_counts,
+            actual_token_counts=actual_token_counts,
             token_source_ranks=token_source_ranks,
             token_source_rank_mapping=_token_source_rank_mapping(
                 topology_routing_state.token_topology_config,
@@ -396,6 +397,7 @@ def apply_topology_aware_routing(
             solver_config=topology_routing_state.solver_config,
         )
 
+    # print(f"[TopologyRouting] rank={topology_routing_state.ep_rank} reroute enabled, routed_weights.shape={tuple(routed_weights.shape)}, routed_ids.shape={tuple(routed_ids.shape)}")
 
     local_routed_weights = routed_weights[rank_start:rank_end]
     local_routed_ids = routed_ids[rank_start:rank_end]
@@ -611,46 +613,66 @@ def _resolve_num_local_experts(num_local_experts: int, num_experts: int,
     return max(1, num_experts // ep_size)
 
 
-def _resolve_token_counts(router_logits: torch.Tensor, ep_size: int,
-                          ep_rank: int,
-                          comm_type: Optional[MoECommType]) -> torch.Tensor:
+def _resolve_token_counts(
+    router_logits: torch.Tensor,
+    ep_size: int,
+    ep_rank: int,
+    comm_type: Optional[MoECommType],
+    valid_token_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     local_tokens = int(router_logits.shape[0])
+    observed_tokens = local_tokens
+    if valid_token_mask is not None:
+        if int(valid_token_mask.shape[0]) != local_tokens:
+            raise RuntimeError(
+                "Topology-aware routing valid_token_mask must match "
+                "router_logits first dimension when resolving token counts, "
+                f"but got valid_token_mask.shape[0]={int(valid_token_mask.shape[0])} "
+                f"and router_logits.shape[0]={local_tokens}.")
+        observed_tokens = int(valid_token_mask.to(dtype=torch.bool).sum().item())
+
     ctx = get_forward_context()
 
     try:
-        counts = ctx.dp_metadata.num_tokens_across_dp_cpu.to(torch.int64).cpu()
+        actual_counts = ctx.dp_metadata.num_tokens_across_dp_cpu.to(torch.int64).cpu()
     except (AssertionError, AttributeError) as exc:
         raise RuntimeError(
             "Topology-aware routing requires dp_metadata.num_tokens_across_dp_cpu "
             "in pure dp+ep mode.") from exc
 
-    if counts.numel() != ep_size:
+    if actual_counts.numel() != ep_size:
         raise RuntimeError(
             "Topology-aware routing expects pure dp+ep mode with matching "
-            f"dp/ep sizes, but got len(num_tokens_across_dp_cpu)={counts.numel()} "
+            f"dp/ep sizes, but got len(num_tokens_across_dp_cpu)={actual_counts.numel()} "
             f"and ep_size={ep_size}.")
     if not 0 <= ep_rank < ep_size:
         raise RuntimeError(
             f"Invalid ep_rank={ep_rank} for ep_size={ep_size}.")
 
     if comm_type == MoECommType.ALLGATHER:
-        total_tokens = int(counts.sum().item())
-        if total_tokens != local_tokens:
+        total_tokens = int(actual_counts.sum().item())
+        if total_tokens != observed_tokens:
             raise RuntimeError(
-                "Topology-aware routing expects ALLGATHER router_logits to "
-                "already be the global token view in pure dp+ep mode, but got "
-                f"sum(num_tokens_across_dp_cpu)={total_tokens} and "
+                "Topology-aware routing expects ALLGATHER router_logits valid "
+                "tokens to match dp_metadata in pure dp+ep mode, but got "
+                f"sum(num_tokens_across_dp_cpu)={total_tokens}, "
+                f"observed_valid_tokens={observed_tokens}, and "
                 f"router_logits.shape[0]={local_tokens}.")
-        return counts
+        return actual_counts, actual_counts
 
-    expected_local_tokens = int(counts[ep_rank].item())
-    if expected_local_tokens != local_tokens:
+    expected_local_tokens = int(actual_counts[ep_rank].item())
+    if expected_local_tokens != observed_tokens:
         raise RuntimeError(
-            "Topology-aware routing expects local router_logits to match "
-            "dp_metadata for non-ALLGATHER communication in pure dp+ep mode, "
+            "Topology-aware routing expects local valid router_logits tokens to "
+            "match dp_metadata for non-ALLGATHER communication in pure dp+ep mode, "
             f"but got num_tokens_across_dp_cpu[{ep_rank}]="
-            f"{expected_local_tokens} and router_logits.shape[0]={local_tokens}.")
-    return counts
+            f"{expected_local_tokens}, observed_valid_tokens={observed_tokens}, "
+            f"and router_logits.shape[0]={local_tokens}.")
+
+    # The tensors gathered for logging include padded rows, so gather counts
+    # must describe the runtime row shape rather than the valid token count.
+    runtime_counts = torch.full_like(actual_counts, local_tokens)
+    return actual_counts, runtime_counts
 
 def _gather_uneven(tensor: torch.Tensor, counts: torch.Tensor, ep_group):
     total = int(counts.sum().item())
