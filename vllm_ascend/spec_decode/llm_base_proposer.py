@@ -415,6 +415,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        is_graph_warmup=False,
     ):
         (
             num_tokens,
@@ -528,6 +529,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
             uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
+            is_graph_capturing=in_graph_capturing,
+            is_graph_warmup=is_graph_warmup,
         ):
             # Reset MOE layer index before first model call
             forward_context = get_forward_context()

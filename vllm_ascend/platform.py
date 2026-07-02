@@ -705,6 +705,7 @@ class NPUPlatform(Platform):
         cudagraph_runtime_mode=None,
         batch_descriptor=None,
         ubatch_slices=None,
+        is_graph_warmup: bool = False,
     ) -> dict[str, Any]:
         """set additional forward context for ascend npus.
 
@@ -818,6 +819,8 @@ class NPUPlatform(Platform):
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
             "capturing": capturing,
+            "my_capturing": capturing,
+            "is_graph_warmup": bool(is_graph_warmup),
             "mmrs_fusion": mmrs_fusion,
             "num_tokens": num_tokens,
             "flash_comm_v1_enabled": flash_comm_v1_enabled,

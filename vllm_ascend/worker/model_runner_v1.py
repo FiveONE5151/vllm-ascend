@@ -3070,6 +3070,7 @@ class NPUModelRunner(GPUModelRunner):
         skip_eplb: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
+        is_graph_warmup: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
@@ -3304,6 +3305,8 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
                 uniform_decode=uniform_decode,
+                is_graph_capturing=is_graph_capturing,
+                is_graph_warmup=is_graph_warmup,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3325,6 +3328,7 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    is_graph_warmup=is_graph_warmup,
                 )
             if is_profile and self.dynamic_eplb:
                 target = self.model.language_model if hasattr(self.model, "language_model") else self.model

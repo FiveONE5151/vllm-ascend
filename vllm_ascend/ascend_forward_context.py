@@ -71,6 +71,8 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     uniform_decode: bool = False,
+    is_graph_capturing: bool = False,
+    is_graph_warmup: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -84,6 +86,7 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "is_graph_warmup": is_graph_warmup,
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
@@ -103,10 +106,11 @@ def set_ascend_forward_context(
         tp_world_size = get_tensor_model_parallel_world_size()
 
         forward_context.in_profile_run = in_profile_run
+        forward_context.is_graph_warmup = bool(is_graph_warmup)
 
-        # NOTE: This cannot be set using set_forward_context
-        # due to multiple warmups before actual capturing
-        forward_context.capturing = False
+        # Explicitly distinguish graph warmup from actual graph capture.
+        forward_context.capturing = bool(is_graph_capturing)
+        forward_context.my_capturing = bool(is_graph_capturing)
 
         # TODO: remove it when fia merge in fiav2
         forward_context.sinks = has_sinks
@@ -378,6 +382,8 @@ class _ExtraForwardContextProxy:
 
     extra_attrs = (
         "capturing",
+        "my_capturing",
+        "is_graph_warmup",
         "moe_comm_type",
         "moe_comm_method",
         "mmrs_fusion",

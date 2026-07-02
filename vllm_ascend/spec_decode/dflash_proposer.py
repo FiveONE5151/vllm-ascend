@@ -151,12 +151,14 @@ class AscendDflashProposer(AscendEagleProposer):
     def dummy_run(
         self,
         num_tokens: int,
+        in_graph_capturing: bool = False,
         num_reqs: int = 0,
         num_tokens_across_dp: torch.Tensor | None = None,
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        is_graph_warmup=False,
         **kwargs,
     ) -> None:
         num_query_tokens = min(num_tokens, self.max_query_tokens)
@@ -221,6 +223,8 @@ class AscendDflashProposer(AscendEagleProposer):
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
             uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
+            is_graph_capturing=in_graph_capturing,
+            is_graph_warmup=is_graph_warmup,
         ):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)

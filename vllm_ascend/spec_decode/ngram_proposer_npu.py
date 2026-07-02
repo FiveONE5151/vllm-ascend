@@ -22,6 +22,7 @@ class AscendNgramProposerNPU(NgramProposerGPU):
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        is_graph_warmup=False,
     ):
         pass
 

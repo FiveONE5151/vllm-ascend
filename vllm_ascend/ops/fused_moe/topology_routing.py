@@ -251,8 +251,19 @@ def apply_topology_aware_routing(
     graph_mode = bool(getattr(ctx, "my_capturing", False) or
                       getattr(ctx, "capturing", False) or
                       runtime_mode_name != "NONE")
+    graph_warmup = bool(getattr(ctx, "is_graph_warmup", False))
     logging_requested = bool(envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING)
     logging_enabled = logging_requested
+    if logging_enabled and graph_warmup:
+        _warn_skip_routing_log_once(
+            "graph_warmup",
+            "Skip TAR routing log during graph warmup.")
+        logging_enabled = False
+    if logging_enabled and bool(getattr(ctx, "in_profile_run", False)):
+        _warn_skip_routing_log_once(
+            "profile_run",
+            "Skip TAR routing log during profile run.")
+        logging_enabled = False
     if logging_enabled and graph_mode:
         _warn_skip_routing_log_once(
             "graph_mode",

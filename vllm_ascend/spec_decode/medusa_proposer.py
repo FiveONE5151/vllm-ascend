@@ -24,6 +24,7 @@ class AscendMedusaProposer(MedusaProposer):
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        is_graph_warmup=False,
     ):
         hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size),
@@ -40,6 +41,8 @@ class AscendMedusaProposer(MedusaProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             uniform_decode=batch_descriptor.uniform if batch_descriptor is not None else False,
+            is_graph_capturing=in_graph_capturing,
+            is_graph_warmup=is_graph_warmup,
         ):
             self.model(hidden_states)
             dummy_compute_logits(hidden_states)
