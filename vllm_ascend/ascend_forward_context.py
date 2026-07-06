@@ -182,8 +182,10 @@ def set_ascend_forward_context(
         dp_group = get_dp_group()
         dp_world_size = dp_group.world_size
         forward_context.runtime_enable_tar = False
-        if envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
-            forward_context.runtime_enable_tar, forward_context.enable_tar_across_dp = _sync_runtime_enable_tar(uniform_decode, dp_group)
+        tar_config = get_ascend_config().topology_routing_config
+        if tar_config.enabled:
+            local_enable_tar = uniform_decode if tar_config.decode_only else True
+            forward_context.runtime_enable_tar, forward_context.enable_tar_across_dp = _sync_runtime_enable_tar(local_enable_tar, dp_group)
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()

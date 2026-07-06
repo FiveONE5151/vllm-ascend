@@ -35,6 +35,11 @@ _TOKEN_TOPOLOGY_CONFIG_CACHE: tuple[str, Any | None] | None = None
 _LOG_SKIP_WARNINGS: set[str] = set()
 
 
+def _tar_config():
+    from vllm_ascend.ascend_config import get_ascend_config
+    return get_ascend_config().topology_routing_config
+
+
 @dataclass
 class PreparedTokenLayout:
     max_local_tokens: int
@@ -63,7 +68,7 @@ class TopologyRoutingState:
 
     @classmethod
     def from_layer(cls, layer) -> Optional["TopologyRoutingState"]:
-        if not envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+        if not topology_aware_routing_enabled():
             return None
 
         topology_config = _load_topology_config()
@@ -71,7 +76,7 @@ class TopologyRoutingState:
         if token_topology_config is None:
             raise ValueError(
                 "Token topology config is required for topology-aware routing. "
-                "Set VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG.")
+                "Set additional_config.topology_routing_config.token_config.")
         if getattr(token_topology_config, "token_source_policy",
                    None) != "uniform_ep_rank":
             raise ValueError(
@@ -126,7 +131,7 @@ class TopologyRoutingState:
             runtime_num_local_experts=runtime_num_local_experts,
             virtual_num_local_experts=virtual_num_local_experts,
             global_num_experts=global_num_experts,
-            route_method=envs.VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY,
+            route_method=_tar_config().strategy,
             solver_config=solver_config,
             token_topology_config=token_topology_config,
             rank_to_node=rank_to_node,
@@ -184,21 +189,21 @@ class TopologyRoutingState:
 
 
 def topology_aware_routing_enabled() -> bool:
-    return envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING
+    return bool(_tar_config().enabled)
 
 
 def validate_topology_routing_runtime(*, multistream_overlap_gate: bool) -> None:
-    if not envs.VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING:
+    if not topology_aware_routing_enabled():
         return
     if getattr(envs, "VLLM_ENABLE_TOKEN_DROP", False):
         raise ValueError(
-            "VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING and VLLM_ENABLE_TOKEN_DROP "
-            "cannot both be enabled.")
+            "additional_config.topology_routing_config.enabled and "
+            "VLLM_ENABLE_TOKEN_DROP cannot both be enabled.")
     if multistream_overlap_gate:
         raise ValueError(
             "Topology-aware routing does not support multistream_overlap_gate. "
             "Disable multistream overlap gate before enabling "
-            "VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING.")
+            "additional_config.topology_routing_config.enabled.")
 
 
 def apply_topology_aware_routing(
@@ -229,8 +234,8 @@ def apply_topology_aware_routing(
     if getattr(envs, "VLLM_ENABLE_TOKEN_DROP", False):
         raise ValueError(
             "Topology-aware routing and token drop are mutually exclusive. "
-            "Set only one of VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING or "
-            "VLLM_ENABLE_TOKEN_DROP.")
+            "Set only one of additional_config.topology_routing_config.enabled "
+            "or VLLM_ENABLE_TOKEN_DROP.")
     if topology_routing_state is None:
         raise RuntimeError(
             "Topology-aware routing is enabled but no TopologyRoutingState was "
@@ -248,7 +253,7 @@ def apply_topology_aware_routing(
                       getattr(ctx, "capturing", False) or
                       runtime_mode_name != "NONE")
     graph_warmup = bool(getattr(ctx, "is_graph_warmup", False))
-    logging_requested = bool(envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING)
+    logging_requested = bool(_tar_config().logging)
     logging_enabled = logging_requested
     if logging_enabled and graph_warmup:
         _warn_skip_routing_log_once(
@@ -441,7 +446,7 @@ def _load_route_function():
 
 def _load_topology_config():
     global _TOPOLOGY_CONFIG_CACHE
-    config_path = envs.VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG
+    config_path = _tar_config().topology_config
     if _TOPOLOGY_CONFIG_CACHE is not None and _TOPOLOGY_CONFIG_CACHE[0] == config_path:
         return _TOPOLOGY_CONFIG_CACHE[1]
     if not config_path:
@@ -455,7 +460,7 @@ def _load_topology_config():
 
 def _load_token_topology_config():
     global _TOKEN_TOPOLOGY_CONFIG_CACHE
-    config_path = envs.VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG
+    config_path = _tar_config().token_config
     if _TOKEN_TOPOLOGY_CONFIG_CACHE is not None and _TOKEN_TOPOLOGY_CONFIG_CACHE[0] == config_path:
         return _TOKEN_TOPOLOGY_CONFIG_CACHE[1]
     if not config_path:
@@ -469,19 +474,17 @@ def _load_token_topology_config():
 
 def _load_solver_config(topology_config):
     global _SOLVER_CONFIG_CACHE
-    raw = envs.VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON
-    if _SOLVER_CONFIG_CACHE is not None and _SOLVER_CONFIG_CACHE[0] == raw:
+    configured = _tar_config().solver_config
+    cache_key = json.dumps(configured, sort_keys=True) if configured is not None else ""
+    if _SOLVER_CONFIG_CACHE is not None and _SOLVER_CONFIG_CACHE[0] == cache_key:
         return _SOLVER_CONFIG_CACHE[1]
-    if raw:
-        config = json.loads(raw)
-        if not isinstance(config, dict):
-            raise ValueError(
-                "VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON must be a JSON object")
+    if configured is not None:
+        config = configured
     elif topology_config is not None:
         config = topology_config.solver_config
     else:
         config = None
-    _SOLVER_CONFIG_CACHE = (raw, config)
+    _SOLVER_CONFIG_CACHE = (cache_key, config)
     return config
 
 
@@ -581,7 +584,9 @@ def _build_token_source_ranks_for_routing(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     if token_topology_config is None:
         raise ValueError(
-            "Token topology config is required for topology-aware routing. Please set VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG to a valid config file path or provide a config with token topology settings."
+            "Token topology config is required for topology-aware routing. "
+            "Please set additional_config.topology_routing_config.token_config "
+            "to a valid config file path."
         )
 
     from topology_aware_routing import build_token_source_ranks_from_config
@@ -835,7 +840,8 @@ def _save_routing_log(
     instance_id = int(moe_instance_id if moe_instance_id is not None else -1)
     layer = str(layer_name or "unknown_layer")
     step = _next_step(instance_id, layer)
-    log_root = Path(envs.VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR)
+    tar_config = _tar_config()
+    log_root = Path(tar_config.log_dir)
     safe_layer = _safe_layer_name(layer)
     file_name = f"router_logits_layer_{instance_id}_step_{step}_{safe_layer}.pt"
     if valid_token_mask is None:
@@ -855,8 +861,10 @@ def _save_routing_log(
         "route_method": route_method,
         "moe_comm_type": comm_type.name if comm_type is not None else None,
         "uniform_decode": bool(getattr(get_forward_context(), "uniform_decode", False)),
-        "topology_config": envs.VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG or None,
-        "token_topology_config": envs.VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG or None,
+        "topology_config": tar_config.topology_config or None,
+        "token_topology_config": tar_config.token_config or None,
+        "topology_routing_config": tar_config.as_dict(),
+        "topology_routing_config_sources": tar_config.sources,
         "token_source_rank_mapping": token_source_rank_mapping,
         "solver_config": solver_config,
         "created_at": datetime.now(timezone.utc).isoformat(),

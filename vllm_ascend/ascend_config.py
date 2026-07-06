@@ -23,6 +23,124 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+class TopologyRoutingConfig:
+    """Topology-aware routing config from additional_config with env fallback."""
+
+    _ENV_KEYS = {
+        "enabled": "VLLM_ENABLE_TOPOLOGY_AWARE_ROUTING",
+        "strategy": "VLLM_TOPOLOGY_AWARE_ROUTING_STRATEGY",
+        "decode_only": "VLLM_TOPOLOGY_AWARE_ROUTING_DECODE_ONLY",
+        "logging": "VLLM_TOPOLOGY_AWARE_ROUTING_LOGGING",
+        "log_dir": "VLLM_TOPOLOGY_AWARE_ROUTING_LOG_DIR",
+        "topology_config": "VLLM_TOPOLOGY_AWARE_ROUTING_CONFIG",
+        "token_config": "VLLM_TOPOLOGY_AWARE_ROUTING_TOKEN_CONFIG",
+        "solver_config": "VLLM_TOPOLOGY_AWARE_ROUTING_SOLVER_CONFIG_JSON",
+    }
+    _DEFAULTS = {
+        "enabled": False,
+        "strategy": "min_cost",
+        "decode_only": True,
+        "logging": False,
+        "log_dir": "topology_routing_logs",
+        "topology_config": "",
+        "token_config": "",
+        "solver_config": None,
+    }
+
+    def __init__(self, config: dict[str, Any] | None):
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise ValueError(
+                "additional_config.topology_routing_config must be a dict, "
+                f"got {type(config).__name__}.")
+
+        self.sources: dict[str, str] = {}
+        self.enabled = self._get_bool(config, "enabled")
+        self.strategy = str(self._get_value(config, "strategy"))
+        self.decode_only = self._get_bool(config, "decode_only")
+        self.logging = self._get_bool(config, "logging")
+        self.log_dir = str(self._get_value(config, "log_dir"))
+        self.topology_config = str(self._get_value(config, "topology_config"))
+        self.token_config = str(self._get_value(config, "token_config"))
+        self.solver_config = self._get_solver_config(config)
+        self._log_effective_config()
+
+    def _get_value(self, config: dict[str, Any], key: str) -> Any:
+        if key in config:
+            self.sources[key] = "additional_config"
+            return config[key]
+
+        env_key = self._ENV_KEYS[key]
+        if env_key in os.environ:
+            value = os.environ[env_key]
+            self.sources[key] = "env_fallback"
+            logger.warning_once(
+                "additional_config.topology_routing_config.%s falls back to "
+                "deprecated environment variable %s with value %s. Please use "
+                "--additional-config '{\"topology_routing_config\": {...}}' "
+                "instead.",
+                key,
+                env_key,
+                value,
+            )
+            return value
+
+        self.sources[key] = "default"
+        return self._DEFAULTS[key]
+
+    def _get_bool(self, config: dict[str, Any], key: str) -> bool:
+        value = self._get_value(config, key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered in ("1", "true", "yes", "on"):
+                return True
+            if lowered in ("0", "false", "no", "off", ""):
+                return False
+        raise ValueError(
+            f"additional_config.topology_routing_config.{key} must be a bool, "
+            f"got {value!r}.")
+
+    def _get_solver_config(self, config: dict[str, Any]) -> dict[str, Any] | None:
+        value = self._get_value(config, "solver_config")
+        if value in (None, ""):
+            return None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError(
+            "additional_config.topology_routing_config.solver_config must be "
+            "a JSON object/dict.")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "strategy": self.strategy,
+            "decode_only": self.decode_only,
+            "logging": self.logging,
+            "log_dir": self.log_dir,
+            "topology_config": self.topology_config,
+            "token_config": self.token_config,
+            "solver_config": self.solver_config,
+        }
+
+    def _log_effective_config(self) -> None:
+        if not self.enabled:
+            return
+        payload = self.as_dict()
+        payload["sources"] = self.sources
+        logger.info_once(
+            "Topology-aware routing config is enabled: %s",
+            json.dumps(payload, sort_keys=True),
+        )
+
 
 class AscendConfig:
     """
@@ -73,6 +191,9 @@ class AscendConfig:
             )
 
         from vllm_ascend import envs as ascend_envs
+
+        topology_routing_config = additional_config.get("topology_routing_config", {})
+        self.topology_routing_config = TopologyRoutingConfig(topology_routing_config)
 
         self.enable_balance_scheduling = self._get_config_value(
             additional_config,
