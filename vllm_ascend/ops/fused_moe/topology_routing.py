@@ -203,12 +203,12 @@ def validate_topology_routing_runtime(*, multistream_overlap_gate: bool) -> None
 
 def apply_topology_aware_routing(
     *,
-    hidden_states: torch.Tensor,
+    hidden_states: Optional[torch.Tensor] = None,
     router_logits: torch.Tensor,
     topk_weights: Optional[torch.Tensor],
     topk_ids: Optional[torch.Tensor],
     top_k: int,
-    use_grouped_topk: bool,
+    use_grouped_topk: bool = False,
     scoring_func: str,
     renormalize: bool,
     global_num_experts: int,
@@ -237,10 +237,6 @@ def apply_topology_aware_routing(
             "passed from the AscendFusedMoE layer.")
 
     ctx = get_forward_context()
-    if scoring_func == "sigmoid":
-        raise ValueError(
-            "Topology-aware routing currently supports softmax/logits/raw "
-            "scoring only; got scoring_func='sigmoid'.")
     if int(top_k) != topology_routing_state.top_k:
         raise RuntimeError(
             f"TAR state top_k={topology_routing_state.top_k} does not match "
@@ -323,6 +319,12 @@ def apply_topology_aware_routing(
             "rank_to_node": topology_routing_state.rank_to_node,
         },
         "solver_config": topology_routing_state.solver_config,
+        "selection_config": {
+            "use_grouped_topk": use_grouped_topk,
+            "topk_group": topk_group,
+            "num_expert_group": num_expert_group,
+            "e_score_correction_bias": e_score_correction_bias,
+        },
     }
     if global_valid_mask is not None:
         route_kwargs["valid_token_mask"] = global_valid_mask
@@ -342,6 +344,8 @@ def apply_topology_aware_routing(
     routed_ids = routed_ids.to(device=router_logits.device, dtype=torch.int32)
     routed_weights = routed_weights.to(device=router_logits.device,
                                        dtype=torch.bfloat16)
+    if routed_scaling_factor != 1.0:
+        routed_weights = routed_weights * routed_scaling_factor
 
     if logging_enabled:
         baseline_topk_weights = topk_weights
