@@ -293,33 +293,34 @@ def apply_topology_aware_routing(
 
     output_rows = int(router_logits.shape[0])
     if comm_type == MoECommType.ALLGATHER:
-        global_router_logits = router_logits
-        global_valid_mask = getattr(ctx, "tar_global_valid_token_mask", None)
-        if global_valid_mask is None or int(global_valid_mask.shape[0]) != int(router_logits.shape[0]):
-            global_valid_mask = local_valid_mask
-            if global_valid_mask is not None and int(global_valid_mask.shape[0]) != int(router_logits.shape[0]):
-                global_valid_mask = None
+        route_router_logits = router_logits
+        route_valid_mask = getattr(ctx, "tar_global_valid_token_mask", None)
+        if route_valid_mask is None or int(route_valid_mask.shape[0]) != int(router_logits.shape[0]):
+            route_valid_mask = local_valid_mask
+            if route_valid_mask is not None and int(route_valid_mask.shape[0]) != int(router_logits.shape[0]):
+                route_valid_mask = None
         else:
-            global_valid_mask = global_valid_mask.to(device=router_logits.device, dtype=torch.bool)
+            route_valid_mask = route_valid_mask.to(device=router_logits.device,
+                                                   dtype=torch.bool)
+        route_token_source_ranks = layout.token_source_ranks[
+            :int(route_router_logits.shape[0])]
         rank_start = 0
         rank_end = max_local_tokens
     else:
-        global_router_logits = _fixed_gather_first_dim(
-            router_logits, topology_routing_state.runtime_ep_size, ep_group)
-        global_valid_mask = (
-            None if local_valid_mask is None else _fixed_gather_first_dim(
-                local_valid_mask, topology_routing_state.runtime_ep_size, ep_group))
-        rank_start = layout.local_start
-        rank_end = layout.local_end
+        route_router_logits = router_logits
+        route_valid_mask = local_valid_mask
+        route_token_source_ranks = layout.token_source_ranks[
+            layout.local_start:layout.local_end]
+        rank_start = 0
+        rank_end = output_rows
 
     route = _load_route_function()
-    global_rows = int(global_router_logits.shape[0])
     route_kwargs = {
         "route_method": topology_routing_state.route_method,
         "scoring_func": scoring_func,
         "renormalize": renormalize,
         "topology_context": {
-            "token_source_ranks": layout.token_source_ranks[:global_rows],
+            "token_source_ranks": route_token_source_ranks,
             "expert_physical_ranks": topology_routing_state.expert_physical_ranks,
             "rank_to_node": topology_routing_state.rank_to_node,
         },
@@ -331,18 +332,18 @@ def apply_topology_aware_routing(
             "e_score_correction_bias": e_score_correction_bias,
         },
     }
-    if global_valid_mask is not None:
-        route_kwargs["valid_token_mask"] = global_valid_mask
+    if route_valid_mask is not None:
+        route_kwargs["valid_token_mask"] = route_valid_mask
     # logger.info(
     #     "[TopologyRouting] mask valid=%d total=%d logits_shape=%s comm=%s",
-    #     int(global_valid_mask.sum().item()) if global_valid_mask is not None else -1,
-    #     int(global_valid_mask.numel()) if global_valid_mask is not None else -1,
-    #     tuple(global_router_logits.shape),
+    #     int(route_valid_mask.sum().item()) if route_valid_mask is not None else -1,
+    #     int(route_valid_mask.numel()) if route_valid_mask is not None else -1,
+    #     tuple(route_router_logits.shape),
     #     comm_type.name if comm_type is not None else None,
     # )
 
     routed_weights, routed_ids = route(
-        global_router_logits,
+        route_router_logits,
         top_k,
         **route_kwargs,
     )
@@ -375,19 +376,32 @@ def apply_topology_aware_routing(
             topology_routing_state.runtime_ep_size,
             topology_routing_state.ep_rank,
             comm_type,
-            global_valid_mask if comm_type == MoECommType.ALLGATHER else local_valid_mask,
+            route_valid_mask if comm_type == MoECommType.ALLGATHER else local_valid_mask,
         )
         if comm_type == MoECommType.ALLGATHER:
+            log_router_logits = route_router_logits
+            log_valid_mask = route_valid_mask
             global_before_topk_ids = baseline_topk_ids
+            global_after_topk_ids = routed_ids
         else:
+            log_router_logits = _fixed_gather_first_dim(
+                router_logits, topology_routing_state.runtime_ep_size,
+                ep_group)
+            log_valid_mask = (
+                None if local_valid_mask is None else _fixed_gather_first_dim(
+                    local_valid_mask,
+                    topology_routing_state.runtime_ep_size, ep_group))
             global_before_topk_ids = _gather_uneven(
                 baseline_topk_ids, runtime_token_counts, ep_group)
-        token_source_ranks = layout.token_source_ranks[:global_rows]
+            global_after_topk_ids = _gather_uneven(
+                routed_ids, runtime_token_counts, ep_group)
+        log_rows = int(log_router_logits.shape[0])
+        token_source_ranks = layout.token_source_ranks[:log_rows]
         _save_routing_log(
-            router_logits=global_router_logits,
+            router_logits=log_router_logits,
             before_topk_ids=global_before_topk_ids,
-            after_topk_ids=routed_ids,
-            valid_token_mask=global_valid_mask,
+            after_topk_ids=global_after_topk_ids,
+            valid_token_mask=log_valid_mask,
             token_counts=_token_counts_from_source_ranks(
                 token_source_ranks, topology_routing_state.virtual_ep_size),
             actual_token_counts=actual_token_counts,
@@ -397,7 +411,7 @@ def apply_topology_aware_routing(
                 topology_routing_state.virtual_ep_size),
             expert_physical_ranks=topology_routing_state.expert_physical_ranks,
             top_k=top_k,
-            num_experts=int(global_router_logits.shape[1]),
+            num_experts=int(log_router_logits.shape[1]),
             num_local_experts=topology_routing_state.virtual_num_local_experts,
             moe_instance_id=moe_instance_id,
             layer_name=layer_name,
