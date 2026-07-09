@@ -24,6 +24,8 @@ def tar_env(monkeypatch, tmp_path):
 
 def _state(max_tokens: int = 4) -> tar.TopologyRoutingState:
     token_source_ranks = torch.zeros(max_tokens, dtype=torch.long)
+    token_source_nodes = torch.zeros(max_tokens, dtype=torch.long)
+    expert_nodes = torch.zeros(4, dtype=torch.long)
     layout = tar.PreparedTokenLayout(
         max_local_tokens=max_tokens,
         max_global_tokens=max_tokens,
@@ -31,6 +33,7 @@ def _state(max_tokens: int = 4) -> tar.TopologyRoutingState:
         local_start=0,
         local_end=max_tokens,
         row_ids=torch.arange(max_tokens, dtype=torch.long),
+        token_source_nodes=token_source_nodes,
     )
     return tar.TopologyRoutingState(
         ep_rank=0,
@@ -43,9 +46,10 @@ def _state(max_tokens: int = 4) -> tar.TopologyRoutingState:
         route_method="min_cost",
         solver_config={},
         token_topology_config=types.SimpleNamespace(token_source_policy="uniform_ep_rank"),
-        rank_to_node=None,
+        rank_to_node=torch.tensor([0], dtype=torch.long),
         expert_physical_ranks=torch.zeros(4, dtype=torch.long),
         prepared_layouts={max_tokens: layout},
+        expert_nodes=expert_nodes,
     )
 
 
@@ -103,6 +107,15 @@ def test_logging_disabled_does_not_compute_baseline(monkeypatch):
     baseline.assert_not_called()
     assert topk_ids.dtype == torch.int32
     assert topk_weights.shape == (4, 2)
+    topology_context = route.call_args.kwargs["topology_context"]
+    assert torch.equal(
+        topology_context["token_source_nodes"],
+        torch.zeros(4, dtype=torch.long),
+    )
+    assert torch.equal(
+        topology_context["expert_nodes"],
+        torch.zeros(4, dtype=torch.long),
+    )
 
 
 def test_graph_mode_skips_online_routing_log(monkeypatch):

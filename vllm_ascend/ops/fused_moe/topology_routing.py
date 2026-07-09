@@ -48,6 +48,7 @@ class PreparedTokenLayout:
     local_start: int
     local_end: int
     row_ids: torch.Tensor
+    token_source_nodes: torch.Tensor | None = None
 
 
 @dataclass
@@ -65,6 +66,7 @@ class TopologyRoutingState:
     rank_to_node: torch.Tensor | None
     expert_physical_ranks: torch.Tensor
     prepared_layouts: dict[int, PreparedTokenLayout]
+    expert_nodes: torch.Tensor | None = None
 
     @classmethod
     def from_layer(cls, layer) -> Optional["TopologyRoutingState"]:
@@ -108,6 +110,10 @@ class TopologyRoutingState:
             device).to(dtype=torch.long)
         _validate_expert_ranks_cover_virtual_topology(
             expert_physical_ranks, rank_to_node, virtual_ep_size)
+        expert_nodes = None
+        if rank_to_node is not None:
+            expert_nodes = rank_to_node[expert_physical_ranks].to(
+                dtype=torch.long).contiguous()
 
         # logger.info(
         #     "TAR from_layer: runtime_ep_size=%d ep_rank=%d virtual_ep_size=%d "
@@ -137,6 +143,7 @@ class TopologyRoutingState:
             rank_to_node=rank_to_node,
             expert_physical_ranks=expert_physical_ranks,
             prepared_layouts={},
+            expert_nodes=expert_nodes,
         )
 
     def prepare_for_tokens(self, max_local_tokens: int) -> PreparedTokenLayout:
@@ -155,6 +162,10 @@ class TopologyRoutingState:
             token_topology_config=self.token_topology_config,
             device=device,
         )
+        token_source_nodes = None
+        if self.rank_to_node is not None:
+            token_source_nodes = self.rank_to_node[token_source_ranks].to(
+                dtype=torch.long).contiguous()
         # logger.info(
         #     "TAR token source rank for max_local_tokens=%d, max_global_tokens=%d: %s",
         #     max_local_tokens,
@@ -171,6 +182,7 @@ class TopologyRoutingState:
             local_start=local_start,
             local_end=local_end,
             row_ids=row_ids,
+            token_source_nodes=token_source_nodes,
         )
         self.prepared_layouts[max_local_tokens] = prepared
         return prepared
@@ -304,6 +316,10 @@ def apply_topology_aware_routing(
                                                    dtype=torch.bool)
         route_token_source_ranks = layout.token_source_ranks[
             :int(route_router_logits.shape[0])]
+        route_token_source_nodes = (
+            None if layout.token_source_nodes is None else
+            layout.token_source_nodes[:int(route_router_logits.shape[0])]
+        )
         rank_start = 0
         rank_end = max_local_tokens
     else:
@@ -311,6 +327,10 @@ def apply_topology_aware_routing(
         route_valid_mask = local_valid_mask
         route_token_source_ranks = layout.token_source_ranks[
             layout.local_start:layout.local_end]
+        route_token_source_nodes = (
+            None if layout.token_source_nodes is None else
+            layout.token_source_nodes[layout.local_start:layout.local_end]
+        )
         rank_start = 0
         rank_end = output_rows
 
@@ -323,6 +343,8 @@ def apply_topology_aware_routing(
             "token_source_ranks": route_token_source_ranks,
             "expert_physical_ranks": topology_routing_state.expert_physical_ranks,
             "rank_to_node": topology_routing_state.rank_to_node,
+            "token_source_nodes": route_token_source_nodes,
+            "expert_nodes": topology_routing_state.expert_nodes,
         },
         "solver_config": topology_routing_state.solver_config,
         "selection_config": {
