@@ -101,6 +101,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import realb_gate_score_capture
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -874,6 +875,13 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        realb_gate_score_capture.begin_step(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
+            attn_state=attn_state,
+            input_ids=self.input_ids.cpu[:total_num_scheduled_tokens],
+        )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2007,6 +2015,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        realb_gate_score_capture.finalize_step()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:

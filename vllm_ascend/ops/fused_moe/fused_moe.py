@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFuse
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
 
+from vllm_ascend import realb_gate_score_capture
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -179,6 +180,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
+        realb_gate_score_capture.record_select_experts(layer=layer, topk_ids=topk_ids, topk_weights=topk_weights)
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 # 0.20.2: capturer is a process-wide singleton.
@@ -632,6 +634,9 @@ class AscendFusedMoE(FusedMoE):
                     num_experts=self.moe_config.num_experts,
                     input_ids=input_ids,
                     tid2eid=self.tid2eid,
+                )
+                realb_gate_score_capture.record_select_experts(
+                    layer=self, topk_ids=topk_ids, topk_weights=topk_weights
                 )
 
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):

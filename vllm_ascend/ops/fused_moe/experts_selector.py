@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend import realb_gate_score_capture
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
@@ -146,6 +147,10 @@ def check_npu_moe_gating_top_k(
     scoring_func: str = "softmax",
     custom_routing_function: Callable | None = None,
 ):
+    if realb_gate_score_capture.force_native_gating_for_current_step():
+        # Cross-check mode: fall back to the reference gating path so a smoke
+        # run can compare it against the fused `moe_gating_top_k` operator.
+        return False
     if scoring_func == "sigmoid" and not renormalize:  # sigmoid + renorm=0 is not supported in current branch
         return False
     if custom_routing_function is not None:

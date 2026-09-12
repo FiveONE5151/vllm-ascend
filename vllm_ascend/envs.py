@@ -114,6 +114,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # ReaLB offline instrumentation (metric 3). When enabled, every prefill
+    # step dumps the top-k expert ids and the combine weights that
+    # `select_experts` actually returned, plus the per-step request/token
+    # layout, so the rank level expert score distribution can be rebuilt
+    # offline. Default 0: no buffer, no synchronisation, no behaviour change.
+    "VLLM_ASCEND_REALB_ROUTING_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_REALB_ROUTING_DUMP", "0"))),
+    # Output directory of the ReaLB routing dump. Required (non-empty) when
+    # VLLM_ASCEND_REALB_ROUTING_DUMP=1, ignored otherwise. No default; point
+    # it at a persistent directory such as
+    # /data/user/ywu753/realb/vredundancy/capture/runs/<run>/raw.
+    "VLLM_ASCEND_REALB_ROUTING_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_REALB_ROUTING_DUMP_DIR", None),
 }
 
 # end-env-vars-definition
